@@ -4,3 +4,4 @@ eventlet
 gunicorn
 firebase-admin
 google-cloud-firestore
+pyserial==3.5
