@@ -230,18 +230,27 @@ def logout():
     return redirect(url_for("login"))
 
 @app.route("/")
+@login_required
+def dashboard():
+    return render_template_string(DASH_HTML, username=current_user.id, videos=EXERCISE_VIDEOS)
+
 @app.post("/session/start")
 @login_required
 def session_start():
     global data_buffer
     data_buffer = []
     if SERIAL_ENABLED:
-        ok = start_serial_reader(port=os.environ.get("SERIAL_PORT", "COM6"), baud=115200)
+        ok = start_serial_reader(
+            port=os.environ.get("SERIAL_PORT", "COM6"),
+            baud=115200
+        )
         if not ok:
             return {"ok": False, "msg": "Không mở được cổng serial"}, 500
         return {"ok": True, "mode": "serial"}
     else:
+        # Trên Render (không có COM) vẫn trả ok để UI hoạt động
         return {"ok": True, "mode": "noserial"}
+
 
 @app.post("/session/stop")
 @login_required
@@ -384,35 +393,6 @@ LOGIN_HTML = """
   <button class="btn btn-primary w-100">Đăng nhập</button>
 </form>
 <hr><a class="btn btn-outline-secondary w-100" href="https://sites.google.com">← Trang giới thiệu</a>
-<script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
-<script>
-  const socket = io();
-
-  // Nhận dữ liệu realtime
-  socket.on("imu_data", (msg)=>{
-    const tr = document.querySelector("#tblAngles tr");
-    const tds = tr.querySelectorAll("td");
-    if(tds.length>=3){
-      tds[0].textContent = Number(msg.hip).toFixed(2);
-      tds[1].textContent = Number(msg.knee).toFixed(2);
-      tds[2].textContent = Number(msg.ankle).toFixed(2);
-    }
-  });
-
-  // Bắt đầu đo
-  document.getElementById("btnStart").onclick = async ()=>{
-    const r = await fetch("/session/start",{method:"POST"});
-    const j = await r.json();
-    if(!j.ok) alert(j.msg||"Không start được");
-    else alert("Đã bắt đầu đo");
-  };
-
-  // Kết thúc đo
-  document.getElementById("btnStop").onclick = async ()=>{
-    await fetch("/session/stop",{method:"POST"});
-    alert("Đã dừng đo");
-  };
-</script>
 
 </div></div></div></div></div></body></html>
 """
@@ -556,7 +536,7 @@ q.addEventListener('input', ()=>{
 });
 </script>
 
-</body></html>
+
 """
 
 
@@ -786,6 +766,39 @@ updateVideo();
 document.getElementById('btnToggleSB').addEventListener('click', ()=>{
   document.body.classList.toggle('sb-collapsed');
 });
+</script>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
+<script>
+  // Kết nối socket
+  const socket = io();
+
+  // Nhận dữ liệu realtime & đổ vào bảng 3 cột đã có
+  socket.on("imu_data", (msg) => {
+    const tr = document.querySelector("#tblAngles tr");
+    if (!tr) return;
+    const tds = tr.querySelectorAll("td");
+    if (tds.length >= 3) {
+      if (msg.hip   != null) tds[0].textContent = Number(msg.hip).toFixed(2);
+      if (msg.knee  != null) tds[1].textContent = Number(msg.knee).toFixed(2);
+      if (msg.ankle != null) tds[2].textContent = Number(msg.ankle).toFixed(2);
+    }
+  });
+
+  // Gắn vào đúng 2 nút sẵn có
+  const btnStart = document.getElementById("btnStart");
+  const btnStop  = document.getElementById("btnStop");
+
+  if (btnStart) btnStart.addEventListener("click", async () => {
+    const r = await fetch("/session/start", { method: "POST" });
+    const j = await r.json();
+    if (!j.ok) alert(j.msg || "Không start được phiên đo");
+  });
+
+  if (btnStop) btnStop.addEventListener("click", async () => {
+    const r = await fetch("/session/stop", { method: "POST" });
+    const j = await r.json();
+    if (!j.ok) alert(j.msg || "Không stop được phiên đo");
+  });
 </script>
 
 </body></html>
@@ -1194,3 +1207,4 @@ if __name__ == "__main__":
         debug=True,
         allow_unsafe_werkzeug=True
     )
+
