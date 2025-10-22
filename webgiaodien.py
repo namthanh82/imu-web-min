@@ -1,7 +1,8 @@
 # webgiaodien.py
 import os, json, time, csv
 from datetime import datetime
-
+import threading
+from collections import defaultdict
 # Chỉ bật đọc cổng COM khi chạy ở máy local (Render không có COM)
 SERIAL_ENABLED = os.environ.get("ENABLE_SERIAL", "0") == "1"
 try:
@@ -12,6 +13,68 @@ try:
 except Exception:
     serial = None
     SERIAL_ENABLED = False
+ser = None
+serial_thread = None
+stop_serial_thread = False
+
+def start_serial_reader(port="COM6", baud=115200):
+    """Đọc dữ liệu serial: id,timestamp,yaw,roll,pitch"""
+    global ser, serial_thread, stop_serial_thread
+
+    import serial
+    try:
+        ser = serial.Serial(port, baud, timeout=0.5)
+    except Exception as e:
+        print(" Không mở được cổng serial:", e)
+        return False
+
+    stop_serial_thread = False
+    last_angles = defaultdict(lambda: {"yaw":0,"roll":0,"pitch":0,"ts":0})
+
+    def reader_loop():
+        print(f"📡 Đang đọc dữ liệu từ {port} ...")
+        while not stop_serial_thread:
+            try:
+                line = ser.readline().decode("utf-8").strip()
+                if not line:
+                    continue
+
+                parts = line.split(",")
+                if len(parts) < 5:
+                    continue
+
+                sid = int(parts[0])
+                ts  = float(parts[1])
+                yaw = float(parts[2])
+                roll = float(parts[3])
+                pitch = float(parts[4])
+
+                # Lưu tạm góc của mỗi cảm biến
+                last_angles[sid] = {"yaw":yaw,"roll":roll,"pitch":pitch,"ts":ts}
+
+                # Nếu có đủ cả 3 ID (1,2,3) thì gom và emit
+                if all(k in last_angles for k in (1,2,3)):
+                    hip   = last_angles[1]["pitch"]
+                    knee  = last_angles[2]["pitch"]
+                    ankle = last_angles[3]["pitch"]
+                    t     = last_angles[1]["ts"]
+
+                    # Gọi append_samples (như trước)
+                    append_samples([{
+                        "t_ms": t,
+                        "hip": hip,
+                        "knee": knee,
+                        "ankle": ankle
+                    }])
+
+            except Exception as e:
+                print("Serial read error:", e)
+
+        print("Dừng đọc serial")
+
+    serial_thread = threading.Thread(target=reader_loop, daemon=True)
+    serial_thread.start()
+    return True
 
 from flask import Flask, render_template_string, request, redirect, url_for, flash
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
@@ -1050,13 +1113,20 @@ def save_patient():
     except Exception as e:
         print("Lỗi khi lưu Firestore:", e)
         return {"ok": False, "error": str(e)}, 500
-
+        
+def stop_serial_reader():
+    global stop_serial_thread, ser
+    stop_serial_thread = True
+    if ser:
+        try: ser.close()
+        except: pass
 # ===================== Run =====================
 if __name__ == "__main__":
     socketio.run(
         app,
         host="0.0.0.0",
-        port=8080,
+        port=int(os.environ.get("PORT", 8080)),
         debug=True,
         allow_unsafe_werkzeug=True
     )
+
