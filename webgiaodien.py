@@ -22,12 +22,9 @@ stop_serial_thread = False
 data_buffer = []
 
 # =========================================================
-# APPEND SAMPLES (Emit SocketIO)
+#  APPEND SAMPLES (Emit SocketIO)
 # =========================================================
 def append_samples(samples):
-    """
-    samples: list of dict như {"t_ms":..., "hip":..., "knee":..., "ankle":...}
-    """
     global data_buffer
     for s in samples:
         data_buffer.append(s)
@@ -39,14 +36,14 @@ def append_samples(samples):
         })
 
 # =========================================================
-# START / STOP SERIAL READER
+#  START / STOP SERIAL READER
 # =========================================================
 def start_serial_reader(port="COM6", baud=115200):
     """Đọc dữ liệu serial: id,timestamp,yaw,roll,pitch"""
     global ser, serial_thread, stop_serial_thread
 
     if not SERIAL_ENABLED:
-        print("SERIAL_DISABLED – bỏ qua đọc cổng COM")
+        print(" SERIAL_DISABLED – bỏ qua đọc cổng COM")
         return True
 
     try:
@@ -59,7 +56,7 @@ def start_serial_reader(port="COM6", baud=115200):
     last_angles = defaultdict(lambda: {"yaw":0,"roll":0,"pitch":0,"ts":0})
 
     def reader_loop():
-        print(f"Đang đọc dữ liệu từ {port} ...")
+        print(f"📡 Đang đọc dữ liệu từ {port} ...")
         while not stop_serial_thread:
             try:
                 line = ser.readline().decode("utf-8", errors="ignore").strip()
@@ -88,7 +85,7 @@ def start_serial_reader(port="COM6", baud=115200):
             except Exception as e:
                 print("Serial read error:", e)
 
-        print(" Dừng đọc serial")
+        print("Dừng đọc serial")
 
     serial_thread = threading.Thread(target=reader_loop, daemon=True)
     serial_thread.start()
@@ -112,30 +109,6 @@ from flask_login import LoginManager, UserMixin, login_user, login_required, log
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_socketio import SocketIO
 
-# ---- Firebase (tùy chọn) ----
-import firebase_admin
-from firebase_admin import credentials, firestore
-
-def find_firebase_key():
-    candidates = [
-        os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"),
-        "/etc/secrets/firebase-key.json",
-        os.path.join(os.environ.get("RENDER_SECRETS_DIR", ""), "firebase-key.json"),
-        os.path.join(os.getcwd(), "firebase-key.json"),
-    ]
-    for p in candidates:
-        if p and os.path.isfile(p):
-            return p
-    raise FileNotFoundError("firebase-key.json not found.")
-
-CRED_PATH = find_firebase_key()
-cred = credentials.Certificate(CRED_PATH)
-firebase_admin.initialize_app(cred)
-fs_client = firestore.client()
-
-# =========================================================
-# APP CONFIG
-# =========================================================
 app = Flask(__name__)
 app.secret_key = "CHANGE_ME"
 PATIENTS_FILE = "sample.json"
@@ -144,49 +117,13 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 login_manager = LoginManager(app)
 login_manager.login_view = "login"
 
-USERS = {"komlab": generate_password_hash("123456")}  # đổi khi deploy
-
-EXERCISE_VIDEOS = {
-    "ankle flexion": "/static/videos/ankle flexion.mp4",
-    "hip flexion":   "/static/videos/hip flexion.mp4",
-    "knee flexion":  "/static/videos/knee flexion.mp4",
-}
+USERS = {"komlab": generate_password_hash("123456")}
 
 class User(UserMixin):
     def __init__(self, u): self.id = u
 
 @login_manager.user_loader
 def load_user(u): return User(u) if u in USERS else None
-
-# =========================================================
-# PATIENT HELPERS
-# =========================================================
-def _ensure_patients_file():
-    if not os.path.exists(PATIENTS_FILE):
-        with open(PATIENTS_FILE, "w", encoding="utf-8") as f:
-            json.dump({}, f, ensure_ascii=False, indent=2)
-
-def load_patients_rows():
-    _ensure_patients_file()
-    with open(PATIENTS_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    if not isinstance(data, dict): data = {}
-    rows = []
-    for code, rec in data.items():
-        rows.append({
-            "code": code,
-            "full_name": rec.get("name", ""),
-            "dob": rec.get("DateOfBirth", ""),
-            "national_id": rec.get("ID", ""),
-            "sex": rec.get("Gender", ""),
-        })
-    return sorted(rows, key=lambda r: (r["full_name"] or "").lower()), data
-
-def gen_patient_code(full_name: str) -> str:
-    last = (full_name.split()[-1] if full_name else "BN")
-    base = "".join(ch for ch in last if ch.isalnum())
-    suffix = datetime.now().strftime("%m%d%H%M")
-    return f"{base}{suffix}"
 
 # =========================================================
 # ROUTES
@@ -211,7 +148,7 @@ def logout():
 @app.route("/")
 @login_required
 def dashboard():
-    return render_template_string(DASH_HTML, username=current_user.id, videos=EXERCISE_VIDEOS)
+    return render_template_string(DASH_HTML, username=current_user.id)
 
 # =========================================================
 # START / STOP SESSION
@@ -238,58 +175,67 @@ def session_stop():
     return {"ok": True}
 
 # =========================================================
-# FIRESTORE TEST (tùy chọn)
-# =========================================================
-@app.route("/save_patient", methods=["POST"])
-def save_patient():
-    data = request.get_json(force=True) or {}
-    code = data.get("code") or f"BN{int(time.time())}"
-    try:
-        fs_client.collection("patients").document(code).set(data)
-        return {"ok": True, "code": code}
-    except Exception as e:
-        print("Lỗi Firestore:", e)
-        return {"ok": False, "error": str(e)}, 500
-
-# =========================================================
-# SIMPLE HTML DEMO DASHBOARD (Realtime SocketIO)
+# DASHBOARD HTML (giao diện cũ, thêm SocketIO)
 # =========================================================
 DASH_HTML = """
 <!doctype html><html lang="vi"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>IMU Dashboard</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+<style>
+body{background:#f8fafc;}
+.panel{background:#fff;border-radius:16px;box-shadow:0 6px 16px rgba(0,0,0,.08);padding:16px;}
+</style>
 </head>
-<body class="p-4 bg-light">
-  <h3>IMU Dashboard - {{username}}</h3>
-  <table class="table w-auto bg-white">
-    <thead><tr><th>Hip</th><th>Knee</th><th>Ankle</th></tr></thead>
-    <tbody id="tblAngles"><tr><td>--</td><td>--</td><td>--</td></tr></tbody>
-  </table>
+<body class="p-3">
+<nav class="navbar bg-white shadow-sm mb-3 px-3"><span class="navbar-brand">Xin chào, {{username}}</span></nav>
 
-  <button id="btnStart" class="btn btn-primary">Bắt đầu đo</button>
-  <button id="btnStop" class="btn btn-secondary">Kết thúc đo</button>
+<div class="container">
+  <div class="row g-3">
+    <div class="col-md-8">
+      <div class="panel">
+        <h5>Bảng góc khớp</h5>
+        <table class="table table-bordered text-center align-middle">
+          <thead class="table-light"><tr><th>Hip</th><th>Knee</th><th>Ankle</th></tr></thead>
+          <tbody id="tblAngles"><tr><td>--</td><td>--</td><td>--</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="col-md-4">
+      <div class="panel d-grid gap-2">
+        <button class="btn btn-primary py-2" id="btnStart">Bắt đầu đo</button>
+        <button class="btn btn-danger py-2" id="btnStop">Kết thúc đo</button>
+      </div>
+    </div>
+  </div>
+</div>
 
-  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
-  <script>
-    const socket = io();
-    socket.on("imu_data", msg=>{
-      const tr = document.querySelector("#tblAngles tr");
-      const tds = tr.querySelectorAll("td");
-      if(tds.length>=3){
-        tds[0].textContent = Number(msg.hip).toFixed(2);
-        tds[1].textContent = Number(msg.knee).toFixed(2);
-        tds[2].textContent = Number(msg.ankle).toFixed(2);
-      }
-    });
-    document.getElementById("btnStart").onclick = async ()=>{
-      const r = await fetch("/session/start",{method:"POST"}); const j = await r.json();
-      if(!j.ok) alert(j.msg||"Không start được");
-    };
-    document.getElementById("btnStop").onclick = async ()=>{
-      await fetch("/session/stop",{method:"POST"}); alert("Đã dừng đo");
-    };
-  </script>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
+<script>
+  const socket = io();
+  socket.on("imu_data", msg=>{
+    const tr = document.querySelector("#tblAngles tr");
+    const tds = tr.querySelectorAll("td");
+    if(tds.length>=3){
+      tds[0].textContent = Number(msg.hip).toFixed(2);
+      tds[1].textContent = Number(msg.knee).toFixed(2);
+      tds[2].textContent = Number(msg.ankle).toFixed(2);
+    }
+  });
+
+  document.getElementById("btnStart").onclick = async ()=>{
+    const r = await fetch("/session/start",{method:"POST"});
+    const j = await r.json();
+    if(!j.ok) alert(j.msg||"Không start được");
+    else alert("Bắt đầu đo");
+  };
+
+  document.getElementById("btnStop").onclick = async ()=>{
+    await fetch("/session/stop",{method:"POST"});
+    alert("Đã dừng đo");
+  };
+</script>
 </body></html>
 """
 
@@ -311,7 +257,7 @@ LOGIN_HTML = """
 """
 
 # =========================================================
-#  RUN APP
+# RUN APP
 # =========================================================
 if __name__ == "__main__":
     socketio.run(
