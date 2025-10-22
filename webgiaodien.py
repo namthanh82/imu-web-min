@@ -59,13 +59,23 @@ def start_serial_reader(port="COM6", baud=115200):
                     ankle = last_angles[3]["pitch"]
                     t     = last_angles[1]["ts"]
 
-                    # Gọi append_samples (như trước)
-                    append_samples([{
-                        "t_ms": t,
-                        "hip": hip,
-                        "knee": knee,
-                        "ankle": ankle
-                    }])
+                    # ===== Realtime buffer & emit =====
+def append_samples(samples):
+    """
+    samples: list of dict như {"t_ms":..., "hip":..., "knee":..., "ankle":...}
+    - push vào buffer (nếu bạn muốn lưu CSV sau này)
+    - emit qua SocketIO cho UI
+    """
+    global data_buffer
+    for s in samples:
+        data_buffer.append(s)
+        socketio.emit("imu_data", {
+            "t": s.get("t_ms"),
+            "hip": s.get("hip"),
+            "knee": s.get("knee"),
+            "ankle": s.get("ankle"),
+        })
+
 
             except Exception as e:
                 print("Serial read error:", e)
@@ -295,7 +305,27 @@ def api_patients_save():
     with open(PATIENTS_FILE, "w", encoding="utf-8") as f:
         json.dump(raw, f, ensure_ascii=False, indent=2)
     return {"ok": True, "patient_code": code}
+def session_start():
+    # clear buffer
+    global data_buffer
+    data_buffer = []
 
+    # nếu bật serial mới đọc, còn trên Render thì bỏ qua
+    if SERIAL_ENABLED:
+        ok = start_serial_reader(port=os.environ.get("SERIAL_PORT", "COM6"), baud=115200)
+        if not ok:
+            return {"ok": False, "msg": "Không mở được cổng serial"}, 500
+        return {"ok": True, "mode": "serial"}
+    else:
+        # chế độ cloud/Render: vẫn emit được nếu bạn có nguồn dữ liệu khác,
+        # còn nếu không thì chỉ báo đã start (không có serial).
+        return {"ok": True, "mode": "noserial"}
+@app.post("/session/stop")
+@login_required
+def session_stop():
+    if SERIAL_ENABLED:
+        stop_serial_reader()
+    return {"ok": True}
 @app.delete("/api/patients/<code>")
 @login_required
 def api_patients_delete(code):
@@ -349,6 +379,34 @@ LOGIN_HTML = """
   <button class="btn btn-primary w-100">Đăng nhập</button>
 </form>
 <hr><a class="btn btn-outline-secondary w-100" href="https://sites.google.com">← Trang giới thiệu</a>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
+<script>
+  // Kết nối Socket.IO
+  const socket = io();
+
+  // Cập nhật bảng Hip/Knee/Ankle theo realtime
+  socket.on("imu_data", (msg) => {
+    const tr = document.querySelector("#tblAngles tr");
+    if (!tr) return;
+    const tds = tr.querySelectorAll("td");
+    if (tds.length >= 3) {
+      if (msg.hip   !== undefined && msg.hip   !== null) tds[0].textContent = Number(msg.hip).toFixed(2);
+      if (msg.knee  !== undefined && msg.knee  !== null) tds[1].textContent = Number(msg.knee).toFixed(2);
+      if (msg.ankle !== undefined && msg.ankle !== null) tds[2].textContent = Number(msg.ankle).toFixed(2);
+    }
+  });
+
+  // Nút Bắt đầu / Kết thúc
+  document.getElementById("btnStart").addEventListener("click", async () => {
+    const r = await fetch("/session/start", {method:"POST"});
+    const j = await r.json();
+    if (!j.ok) alert(j.msg || "Không start được phiên đo");
+  });
+  document.getElementById("btnStop").addEventListener("click", async () => {
+    await fetch("/session/stop", {method:"POST"});
+    alert("Đã dừng đo");
+  });
+</script>
 </div></div></div></div></div></body></html>
 """
 
@@ -1129,4 +1187,5 @@ if __name__ == "__main__":
         debug=True,
         allow_unsafe_werkzeug=True
     )
+
 
