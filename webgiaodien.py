@@ -259,10 +259,6 @@ def session_stop():
         stop_serial_reader()
     return {"ok": True}
 
-@login_required
-def dashboard():
-    return render_template_string(DASH_HTML, username=current_user.id, videos=EXERCISE_VIDEOS)
-
 @app.route("/patients")
 @login_required
 def patients_list():
@@ -1207,4 +1203,5 @@ if __name__ == "__main__":
         debug=True,
         allow_unsafe_werkzeug=True
     )
+
 
