@@ -649,7 +649,7 @@ body{ background:#fafbfe }
     <span class="navbar-brand mb-0">Xin chào, {{username}}</span>
     <div class="ms-auto d-flex align-items-center gap-3">
       <a class="btn btn-outline-secondary" href="/logout">Đăng xuất</a>
-      <img src="/static/unnamed.png" alt="Logo" height="48">
+      <img src="{{ url_for('static', filename='unnamed.png') }}" alt="Logo" height="48">
     </div>
   </div>
 </nav>
@@ -1203,5 +1203,6 @@ if __name__ == "__main__":
         debug=True,
         allow_unsafe_werkzeug=True
     )
+
 
 
