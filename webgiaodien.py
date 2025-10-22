@@ -531,7 +531,7 @@ q.addEventListener('input', ()=>{
   }
 });
 </script>
-
+</body></html>
 
 """
 
@@ -722,25 +722,44 @@ body{ background:#fafbfe }
           </video>
         </div>
 
-        <div class="col-lg-7 pull-up-guide">
-          <div class="panel">
-            <div class="text-center mb-3"><span class="title-chip">HƯỚNG DẪN QUY TRÌNH ĐO</span></div>
-            <div class="vstack gap-2">
-              <div class="panel">Bước 1: Hiệu chuẩn thiết bị</div>
-              <div class="panel">Bước 2: Lắp thiết bị</div>
-              <div class="panel">Bước 3: Kiểm tra kết nối</div>
-              <div class="panel">Bước 4: Tiến hành đo</div>
-            </div>
-          </div>
-        </div>
+       <!-- MÔ PHỎNG GÓC GẬP 2D (ở TRÊN) -->
+<div class="col-lg-7 pull-up-guide">
+  <div class="panel">
+    <div class="d-flex align-items-center justify-content-between mb-2">
+      <span class="title-chip">MÔ PHỎNG GÓC GẬP 2D</span>
+      <div class="small text-muted">Nguồn: pitch từ IMU (đơn vị °)</div>
+    </div>
+    <canvas id="angleCanvas" width="520" height="360" style="width:100%;max-width:720px;display:block;margin:auto;"></canvas>
+    <div class="text-center mt-2">
+      <span class="badge text-bg-light border me-2">Hip: <span id="liveHip">--</span>°</span>
+      <span class="badge text-bg-light border me-2">Knee: <span id="liveKnee">--</span>°</span>
+      <span class="badge text-bg-light border">Ankle: <span id="liveAnkle">--</span>°</span>
+    </div>
+  </div>
+</div>
 
-        <div class="col-lg-5">
-          <div class="panel d-grid gap-3">
-            <button class="btn btn-outline-thick py-3" id="btnStart">Bắt đầu đo</button>
-            <button class="btn btn-outline-thick py-3" id="btnStop">Kết thúc đo</button>
-            <button class="btn btn-outline-thick py-3" id="btnSave">Lưu kết quả</button>
-          </div>
-        </div>
+<!-- CỤM NÚT BẮT ĐẦU/KẾT THÚC/ LƯU (giữ nguyên) -->
+<div class="col-lg-5">
+  <div class="panel d-grid gap-3">
+    <button class="btn btn-outline-thick py-3" id="btnStart">Bắt đầu đo</button>
+    <button class="btn btn-outline-thick py-3" id="btnStop">Kết thúc đo</button>
+    <button class="btn btn-outline-thick py-3" id="btnSave">Lưu kết quả</button>
+  </div>
+</div>
+
+<!-- HƯỚNG DẪN QUY TRÌNH ĐO (đưa XUỐNG DƯỚI) -->
+<div class="col-lg-12">
+  <div class="panel">
+    <div class="text-center mb-3"><span class="title-chip">HƯỚNG DẪN QUY TRÌNH ĐO</span></div>
+    <div class="row g-2">
+      <div class="col-md-3"><div class="panel">Bước 1: Hiệu chuẩn thiết bị</div></div>
+      <div class="col-md-3"><div class="panel">Bước 2: Lắp thiết bị</div></div>
+      <div class="col-md-3"><div class="panel">Bước 3: Kiểm tra kết nối</div></div>
+      <div class="col-md-3"><div class="panel">Bước 4: Tiến hành đo</div></div>
+    </div>
+  </div>
+</div>
+
       </div>
     </main>
   </div>
@@ -765,8 +784,9 @@ document.getElementById('btnToggleSB').addEventListener('click', ()=>{
 </script>
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
 <script>
-  // Kết nối socket
-  const socket = io();
+  // Kết nối socket: GÁN vào window để tái dùng ở nơi khác
+  window.socket = window.socket || io();
+  const socket = window.socket;
 
   // Nhận dữ liệu realtime & đổ vào bảng 3 cột đã có
   socket.on("imu_data", (msg) => {
@@ -796,6 +816,99 @@ document.getElementById('btnToggleSB').addEventListener('click', ()=>{
     if (!j.ok) alert(j.msg || "Không stop được phiên đo");
   });
 </script>
+
+<script>
+(function(){
+  const canvas = document.getElementById("angleCanvas");
+  if (!canvas) return; // phòng khi ở trang khác
+
+  const ctx = canvas.getContext("2d");
+  let hipDeg = 0, kneeDeg = 0, ankleDeg = 0;
+
+  // Vẽ mô hình chân đơn giản: hông -> đùi -> cẳng chân
+  function drawModel() {
+    const W = canvas.width, H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
+
+    // toạ độ hông (cố định)
+    const hipX = W/2, hipY = 60;
+
+    // Độ dài các khúc
+    const thigh = 120;  // đùi
+    const shank = 120;  // cẳng chân
+
+    // Quy ước: hipDeg = góc đùi so với trục thẳng xuống (°)
+    // kneeDeg = góc gập tại gối (°), cộng vào hướng của đùi
+    // Chuyển sang rad
+    const hipRad  = (90 + hipDeg) * Math.PI/180;      // 90° để quy về hướng thẳng xuống
+    const kneeRad = hipRad + (kneeDeg * Math.PI/180);
+
+    // Điểm gối
+    const kneeX = hipX + thigh * Math.cos(hipRad);
+    const kneeY = hipY + thigh * Math.sin(hipRad);
+
+    // Điểm mắt cá
+    const ankleX = kneeX + shank * Math.cos(kneeRad);
+    const ankleY = kneeY + shank * Math.sin(kneeRad);
+
+    // Vẽ hông
+    ctx.fillStyle = "#6c757d";
+    ctx.beginPath(); ctx.arc(hipX, hipY, 8, 0, Math.PI*2); ctx.fill();
+
+    // Vẽ đùi
+    ctx.strokeStyle = "#0d6efd";
+    ctx.lineWidth = 8;
+    ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(hipX, hipY); ctx.lineTo(kneeX, kneeY); ctx.stroke();
+
+    // Vẽ cẳng chân
+    ctx.beginPath(); ctx.moveTo(kneeX, kneeY); ctx.lineTo(ankleX, ankleY); ctx.stroke();
+
+    // Vẽ gối & mắt cá
+    ctx.fillStyle = "#0d6efd";
+    ctx.beginPath(); ctx.arc(kneeX, kneeY, 6, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(ankleX, ankleY, 6, 0, Math.PI*2); ctx.fill();
+
+    // Chú thích góc
+    ctx.fillStyle = "#212529";
+    ctx.font = "14px system-ui";
+    ctx.fillText(`Hip: ${hipDeg.toFixed(1)}°`, hipX - 70, hipY - 12);
+    ctx.fillText(`Knee: ${kneeDeg.toFixed(1)}°`, kneeX + 10, kneeY + 4);
+
+    // Cập nhật badge số ở dưới canvas
+    const elHip = document.getElementById("liveHip");
+    const elKnee = document.getElementById("liveKnee");
+    const elAnkle = document.getElementById("liveAnkle");
+    if (elHip) elHip.textContent = hipDeg.toFixed(1);
+    if (elKnee) elKnee.textContent = kneeDeg.toFixed(1);
+    if (elAnkle) elAnkle.textContent = ankleDeg.toFixed(1);
+  }
+
+  <script>
+(function(){
+  const canvas = document.getElementById("angleCanvas");
+  if (!canvas) return;
+
+  const ctx = canvas.getContext("2d");
+  let hipDeg = 0, kneeDeg = 0, ankleDeg = 0;
+
+  function drawModel(){ /* ...giữ nguyên như bạn... */ }
+
+  drawModel();
+
+  // DÙNG LẠI socket đã tạo
+  const sock = window.socket;
+  if (sock) {
+    sock.on("imu_data", (msg) => {
+      if (typeof msg.hip   === "number") hipDeg   = msg.hip;
+      if (typeof msg.knee  === "number") kneeDeg  = msg.knee;
+      if (typeof msg.ankle === "number") ankleDeg = msg.ankle;
+      drawModel();
+    });
+  }
+})();
+</script>
+
 
 </body></html>
 """
@@ -1203,6 +1316,7 @@ if __name__ == "__main__":
         debug=True,
         allow_unsafe_werkzeug=True
     )
+
 
 
 
