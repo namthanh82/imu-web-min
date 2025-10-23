@@ -18,7 +18,7 @@ ser = None
 serial_thread = None
 stop_serial_thread = False
 
-def start_serial_reader(port="COM6", baud=115200):
+def start_serial_reader(port="COM5", baud=115200):
     """Đọc dữ liệu serial: id,timestamp,yaw,roll,pitch"""
     global ser, serial_thread, stop_serial_thread
 
@@ -1334,6 +1334,7 @@ if __name__ == "__main__":
         debug=True,
         allow_unsafe_werkzeug=True
     )
+
 
 
 
