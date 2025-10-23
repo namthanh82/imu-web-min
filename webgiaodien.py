@@ -22,30 +22,38 @@ def start_serial_reader(port="COM5", baud=115200):
     """Đọc dữ liệu serial: id,timestamp,yaw,roll,pitch (4 IMU, dùng pitch)."""
     global ser, serial_thread, stop_serial_thread
 
-    import serial
+    if serial is None:
+        print("PySerial chưa sẵn sàng (SERIAL_ENABLED=0?).")
+        return False
+
     try:
         ser = serial.Serial(port, baud, timeout=0.5)
     except Exception as e:
-        print(" Không mở được cổng serial:", e)
+        print("Không mở được cổng serial:", e)
         return False
 
     stop_serial_thread = False
     last_angles = defaultdict(lambda: {"yaw":0.0,"roll":0.0,"pitch":0.0,"ts":0.0})
 
-    def norm_deg(x):
+    def norm_deg(x: float) -> float:
         while x > 180: x -= 360
         while x < -180: x += 360
         return x
 
     def reader_loop():
-        print(f" Đang đọc dữ liệu từ {port} ...")
+        print(f" Đang đọc dữ liệu từ {port} @ {baud} ...")
         needed = (1,2,3,4)
         while not stop_serial_thread:
             try:
-                line = ser.readline().decode("utf-8", errors="ignore").strip()
+                raw = ser.readline()
+                if not raw:
+                    continue
+                line = raw.decode("utf-8", errors="ignore").strip()
                 if not line:
                     continue
-                parts = line.split(",")  # id,ts,yaw,roll,pitch
+
+                # Kỳ vọng: id,timestamp,yaw,roll,pitch
+                parts = line.split(",")
                 if len(parts) < 5:
                     continue
 
@@ -57,7 +65,7 @@ def start_serial_reader(port="COM5", baud=115200):
 
                 last_angles[sid] = {"yaw":yaw,"roll":roll,"pitch":pitch,"ts":ts}
 
-                # Khi đã có đủ 4 IMU → tính hip/knee/ankle từ pitch
+                # Khi đủ 4 IMU thì tính góc
                 if all(k in last_angles for k in needed):
                     p1 = last_angles[1]["pitch"]
                     p2 = last_angles[2]["pitch"]
@@ -65,11 +73,11 @@ def start_serial_reader(port="COM5", baud=115200):
                     p4 = last_angles[4]["pitch"]
 
                     hip   = norm_deg(p1 - p2)
-                    knee  = norm_deg(p3 - p2)      # nếu bạn muốn p2 - p3, chỉ cần đổi thành norm_deg(p2 - p3)
-                    ankle = norm_deg(p3 - p4 - 90)
+                    knee  = norm_deg(p2 - p3)       # <— CHUẨN THEO BẠN
+                    ankle = norm_deg(p3 - p4 - 90)  # <— CHUẨN THEO BẠN
 
                     append_samples([{
-                        "t_ms": last_angles[1]["ts"],
+                        "t_ms": last_angles[1]["ts"] or time.time()*1000,
                         "hip": hip,
                         "knee": knee,
                         "ankle": ankle
@@ -78,11 +86,12 @@ def start_serial_reader(port="COM5", baud=115200):
             except Exception as e:
                 print("Serial read error:", e)
 
-        print("Dừng đọc serial")
+        print(" Dừng đọc serial")
 
     serial_thread = threading.Thread(target=reader_loop, daemon=True)
     serial_thread.start()
     return True
+
 
 
 from flask import Flask, render_template_string, request, redirect, url_for, flash
@@ -157,13 +166,6 @@ class User(UserMixin):
 
 @login_manager.user_loader
 def load_user(u): return User(u) if u in USERS else None
-
-# ===================== Serial placeholders =====================
-ser = None
-running = False
-reader_thread = None
-collecting = False
-data_buffer = []
 
 # ===================== Patient helpers =====================
 def _ensure_patients_file():
@@ -1328,11 +1330,20 @@ def save_patient():
         return {"ok": False, "error": str(e)}, 500
         
 def stop_serial_reader():
-    global stop_serial_thread, ser
+    global stop_serial_thread, ser, serial_thread
     stop_serial_thread = True
-    if ser:
-        try: ser.close()
+    try:
+        if ser and ser.is_open:
+            ser.close()
+    except: pass
+    ser = None
+    # chờ thread dừng (nhanh)
+    if serial_thread and serial_thread.is_alive():
+        try:
+            serial_thread.join(timeout=1.0)
         except: pass
+    serial_thread = None
+
 # ===================== Run =====================
 if __name__ == "__main__":
     socketio.run(
@@ -1342,6 +1353,7 @@ if __name__ == "__main__":
         debug=True,
         allow_unsafe_werkzeug=True
     )
+
 
 
 
