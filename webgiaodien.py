@@ -888,75 +888,6 @@ document.getElementById('btnToggleSB').addEventListener('click', ()=>{
   }
 })();
 </script>
-
-<script>
-(function(){
-  const canvas = document.getElementById("angleCanvas");
-  if (!canvas) return; // phòng khi ở trang khác
-
-  const ctx = canvas.getContext("2d");
-  let hipDeg = 0, kneeDeg = 0, ankleDeg = 0;
-
-  // Vẽ mô hình chân đơn giản: hông -> đùi -> cẳng chân
-  function drawModel() {
-    const W = canvas.width, H = canvas.height;
-    ctx.clearRect(0, 0, W, H);
-
-    // toạ độ hông (cố định)
-    const hipX = W/2, hipY = 60;
-
-    // Độ dài các khúc
-    const thigh = 120;  // đùi
-    const shank = 120;  // cẳng chân
-
-    // Quy ước: hipDeg = góc đùi so với trục thẳng xuống (°)
-    // kneeDeg = góc gập tại gối (°), cộng vào hướng của đùi
-    // Chuyển sang rad
-    const hipRad  = (90 + hipDeg) * Math.PI/180;      // 90° để quy về hướng thẳng xuống
-    const kneeRad = hipRad + (kneeDeg * Math.PI/180);
-
-    // Điểm gối
-    const kneeX = hipX + thigh * Math.cos(hipRad);
-    const kneeY = hipY + thigh * Math.sin(hipRad);
-
-    // Điểm mắt cá
-    const ankleX = kneeX + shank * Math.cos(kneeRad);
-    const ankleY = kneeY + shank * Math.sin(kneeRad);
-
-    // Vẽ hông
-    ctx.fillStyle = "#6c757d";
-    ctx.beginPath(); ctx.arc(hipX, hipY, 8, 0, Math.PI*2); ctx.fill();
-
-    // Vẽ đùi
-    ctx.strokeStyle = "#0d6efd";
-    ctx.lineWidth = 8;
-    ctx.lineCap = "round";
-    ctx.beginPath(); ctx.moveTo(hipX, hipY); ctx.lineTo(kneeX, kneeY); ctx.stroke();
-
-    // Vẽ cẳng chân
-    ctx.beginPath(); ctx.moveTo(kneeX, kneeY); ctx.lineTo(ankleX, ankleY); ctx.stroke();
-
-    // Vẽ gối & mắt cá
-    ctx.fillStyle = "#0d6efd";
-    ctx.beginPath(); ctx.arc(kneeX, kneeY, 6, 0, Math.PI*2); ctx.fill();
-    ctx.beginPath(); ctx.arc(ankleX, ankleY, 6, 0, Math.PI*2); ctx.fill();
-
-    // Chú thích góc
-    ctx.fillStyle = "#212529";
-    ctx.font = "14px system-ui";
-    ctx.fillText(`Hip: ${hipDeg.toFixed(1)}°`, hipX - 70, hipY - 12);
-    ctx.fillText(`Knee: ${kneeDeg.toFixed(1)}°`, kneeX + 10, kneeY + 4);
-
-    // Cập nhật badge số ở dưới canvas
-    const elHip = document.getElementById("liveHip");
-    const elKnee = document.getElementById("liveKnee");
-    const elAnkle = document.getElementById("liveAnkle");
-    if (elHip) elHip.textContent = hipDeg.toFixed(1);
-    if (elKnee) elKnee.textContent = kneeDeg.toFixed(1);
-    if (elAnkle) elAnkle.textContent = ankleDeg.toFixed(1);
-  }
-  
-</script>
 </body></html>
 """
 
@@ -1363,6 +1294,7 @@ if __name__ == "__main__":
         debug=True,
         allow_unsafe_werkzeug=True
     )
+
 
 
 
