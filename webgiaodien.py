@@ -824,46 +824,81 @@ document.getElementById('btnToggleSB').addEventListener('click', ()=>{
   const ctx  = canvas.getContext("2d");
   let hipDeg = 0, kneeDeg = 0, ankleDeg = 0;
 
-  // (tuỳ chọn) scale HiDPI để nét sắc
-  const dpr  = window.devicePixelRatio || 1;
-  const rect = canvas.getBoundingClientRect();
-  canvas.width  = Math.max(520, Math.round(rect.width  * dpr));
-  canvas.height = Math.max(360, Math.round(rect.height * dpr));
-  ctx.scale(dpr, dpr);
+  // Hiệu chỉnh độ dài/độ dày từng khúc
+  const LEN  = { thigh: 140, shank: 130, foot: 70 };
+  const WIDTH= { thigh: 18,  shank: 12,  foot: 10 };
+
+  // (giữ nguyên phần scale HiDPI của bạn nếu đã có)
+
+  function drawCapsule(x1, y1, x2, y2, w, color) {
+    // viền nhẹ để khối nổi hơn
+    ctx.save();
+    ctx.lineCap = "round";
+
+    ctx.strokeStyle = "rgba(0,0,0,.08)";
+    ctx.lineWidth = w + 4;
+    ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+
+    ctx.strokeStyle = color;
+    ctx.lineWidth = w;
+    ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawJoint(x, y, rOuter=8, rInner=5){
+    ctx.save();
+    ctx.fillStyle = "rgba(0,0,0,.15)";
+    ctx.beginPath(); ctx.arc(x, y, rOuter, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = "#0d6efd";
+    ctx.beginPath(); ctx.arc(x, y, rInner, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
 
   function drawModel() {
-    const W = Math.round(canvas.width  / dpr);
-    const H = Math.round(canvas.height / dpr);
+    // kích thước vẽ theo phần scale DPR bạn đã set trước đó
+    const W = Math.round(canvas.width  / (window.devicePixelRatio||1));
+    const H = Math.round(canvas.height / (window.devicePixelRatio||1));
     ctx.clearRect(0, 0, W, H);
 
-    const hipX = W/2, hipY = 60;
-    const thigh = 120, shank = 120;
+    // hông đặt cố định
+    const hipX = W/2, hipY = 80;
 
-    const hipRad  = (90 + hipDeg) * Math.PI/180;
-    const kneeRad = hipRad + (kneeDeg * Math.PI/180);
+    // quy ước góc như trước: hip so với phương thẳng xuống; knee, ankle là góc gập thêm vào
+    const hipRad   = (90 + hipDeg) * Math.PI/180;
+    const kneeRad  = hipRad + (kneeDeg  * Math.PI/180);
+    const footRad  = kneeRad + (ankleDeg * Math.PI/180);
 
-    const kneeX = hipX + thigh * Math.cos(hipRad);
-    const kneeY = hipY + thigh * Math.sin(hipRad);
-    const ankleX = kneeX + shank * Math.cos(kneeRad);
-    const ankleY = kneeY + shank * Math.sin(kneeRad);
+    // tính các điểm khớp
+    const kneeX  = hipX + LEN.thigh * Math.cos(hipRad);
+    const kneeY  = hipY + LEN.thigh * Math.sin(hipRad);
+    const ankleX = kneeX + LEN.shank * Math.cos(kneeRad);
+    const ankleY = kneeY + LEN.shank * Math.sin(kneeRad);
+    const toeX   = ankleX + LEN.foot  * Math.cos(footRad);
+    const toeY   = ankleY + LEN.foot  * Math.sin(footRad);
 
+    // vẽ khung chậu nhỏ
+    ctx.save();
     ctx.fillStyle = "#6c757d";
-    ctx.beginPath(); ctx.arc(hipX, hipY, 8, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(hipX, hipY, 9, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
 
-    ctx.strokeStyle = "#0d6efd";
-    ctx.lineWidth = 8; ctx.lineCap = "round";
-    ctx.beginPath(); ctx.moveTo(hipX, hipY); ctx.lineTo(kneeX, kneeY); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(kneeX, kneeY); ctx.lineTo(ankleX, ankleY); ctx.stroke();
+    // vẽ các đoạn: đùi → cẳng chân → bàn chân
+    drawCapsule(hipX, hipY, kneeX,  kneeY,  WIDTH.thigh, "#0d6efd");
+    drawCapsule(kneeX, kneeY, ankleX, ankleY, WIDTH.shank, "#1973d4");
+    drawCapsule(ankleX, ankleY, toeX, toeY,  WIDTH.foot,  "#5aa0ff");
 
-    ctx.fillStyle = "#0d6efd";
-    ctx.beginPath(); ctx.arc(kneeX,  kneeY,  6, 0, Math.PI*2); ctx.fill();
-    ctx.beginPath(); ctx.arc(ankleX, ankleY, 6, 0, Math.PI*2); ctx.fill();
+    // vẽ khớp
+    drawJoint(kneeX,  kneeY);
+    drawJoint(ankleX, ankleY, 7, 4);
 
+    // nhãn góc
     ctx.fillStyle = "#212529";
     ctx.font = "14px system-ui";
-    ctx.fillText(`Hip: ${hipDeg.toFixed(1)}°`, hipX - 70, hipY - 12);
-    ctx.fillText(`Knee: ${kneeDeg.toFixed(1)}°`, kneeX + 10, kneeY + 4);
+    ctx.fillText(`Hip: ${hipDeg.toFixed(1)}°`,  hipX - 70, hipY - 16);
+    ctx.fillText(`Knee: ${kneeDeg.toFixed(1)}°`, kneeX + 12, kneeY + 4);
+    ctx.fillText(`Ankle: ${ankleDeg.toFixed(1)}°`, ankleX + 12, ankleY + 4);
 
+    // cập nhật 3 badge dưới canvas (nếu bạn có)
     const elHip = document.getElementById("liveHip");
     const elKnee = document.getElementById("liveKnee");
     const elAnkle = document.getElementById("liveAnkle");
@@ -872,9 +907,17 @@ document.getElementById('btnToggleSB').addEventListener('click', ()=>{
     if (elAnkle) elAnkle.textContent = ankleDeg.toFixed(1);
   }
 
-  // Vẽ lần đầu để thấy mô hình ngay
+  // --- phần hook socket của bạn giữ nguyên ---
+  // ví dụ:
+  // const sock = window.socket;
+  // sock.on("imu_data", msg => { hipDeg=msg.hip; kneeDeg=msg.knee; ankleDeg=msg.ankle; drawModel(); });
+
+  // vẽ lần đầu
   drawModel();
 
+  // expose để bạn test nhanh trong console: setDemo(hip,knee,ankle)
+  window.setDemo = (h=0,k=0,a=0)=>{ hipDeg=h; kneeDeg=k; ankleDeg=a; drawModel(); };
+})();
   // Nhận data realtime từ socket dùng chung
   const sock = window.socket;
   if (sock) {
@@ -1294,6 +1337,7 @@ if __name__ == "__main__":
         debug=True,
         allow_unsafe_werkzeug=True
     )
+
 
 
 
