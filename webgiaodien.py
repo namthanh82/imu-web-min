@@ -729,7 +729,7 @@ body{ background:#fafbfe }
       <span class="title-chip">MÔ PHỎNG GÓC GẬP 2D</span>
       <div class="small text-muted">Nguồn: pitch từ IMU (đơn vị °)</div>
     </div>
-    <canvas id="angleCanvas" width="520" height="360" style="width:100%;max-width:720px;display:block;margin:auto;"></canvas>
+    <canvas id="angleCanvas" width="520" height="400" style="width:100%;max-width:720px;display:block;margin:auto;"></canvas>
     <div class="text-center mt-2">
       <span class="badge text-bg-light border me-2">Hip: <span id="liveHip">--</span>°</span>
       <span class="badge text-bg-light border me-2">Knee: <span id="liveKnee">--</span>°</span>
@@ -820,28 +820,27 @@ document.getElementById('btnToggleSB').addEventListener('click', ()=>{
 (function(){
   const canvas = document.getElementById("angleCanvas");
   if (!canvas) return;
-
-  const ctx  = canvas.getContext("2d");
+  const ctx = canvas.getContext("2d");
   let hipDeg = 0, kneeDeg = 0, ankleDeg = 0;
 
-  // Kích thước “chuẩn” trước khi scale
-  const LEN0  = { thigh: 140, shank: 130, foot: 70 };
-  const WIDTH0= { thigh: 18,  shank: 12,  foot: 10 };
+  // Kích thước gốc và tỷ lệ
+  const LEN0  = { thigh: 160, shank: 150, foot: 80 };
+  const WIDTH0= { thigh: 26,  shank: 18,  foot: 12 };
 
   function drawCapsule(x1, y1, x2, y2, w, color) {
     ctx.save();
     ctx.lineCap = "round";
     ctx.strokeStyle = "rgba(0,0,0,.08)";
-    ctx.lineWidth = w + 4;
+    ctx.lineWidth = w + 6;
     ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
     ctx.strokeStyle = color;
     ctx.lineWidth = w;
     ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
     ctx.restore();
   }
-  function drawJoint(x, y, rOuter=8, rInner=5){
+  function drawJoint(x, y, rOuter=10, rInner=6){
     ctx.save();
-    ctx.fillStyle = "rgba(0,0,0,.15)";
+    ctx.fillStyle = "rgba(0,0,0,.2)";
     ctx.beginPath(); ctx.arc(x, y, rOuter, 0, Math.PI*2); ctx.fill();
     ctx.fillStyle = "#0d6efd";
     ctx.beginPath(); ctx.arc(x, y, rInner, 0, Math.PI*2); ctx.fill();
@@ -849,39 +848,34 @@ document.getElementById('btnToggleSB').addEventListener('click', ()=>{
   }
 
   function drawModel() {
-    const dpr  = window.devicePixelRatio || 1;
-
-    // Làm canvas khớp bề rộng khung (giữ thuộc tính height=360 nhưng vẫn HiDPI)
+    const dpr = window.devicePixelRatio || 1;
     const rect = canvas.getBoundingClientRect();
-    canvas.width  = Math.round(rect.width * dpr);
-    canvas.height = Math.round(360 * dpr);           // đúng với height attribute của bạn
-    ctx.setTransform(dpr,0,0,dpr,0,0);               // scale HiDPI
-    const W = Math.round(canvas.width / dpr);
-    const H = Math.round(canvas.height / dpr);
+    canvas.width  = rect.width  * dpr;
+    canvas.height = rect.height * dpr;
+    ctx.setTransform(dpr,0,0,dpr,0,0);
 
-    // Tính scale để KHÔNG tràn
-    const MARGIN_TOP = 60;
-    const MARGIN_BOT = 60; // chừa chỗ cho chữ/foot
-    const total0 = LEN0.thigh + LEN0.shank + LEN0.foot;
-    const maxDraw = Math.max(100, H - MARGIN_TOP - MARGIN_BOT);
-    const scale = Math.min(1, maxDraw / total0);
-
-    // Áp scale cho chiều dài & độ dày, có ngưỡng tối thiểu để không quá mảnh
-    const LEN   = {
-      thigh: LEN0.thigh*scale,
-      shank: LEN0.shank*scale,
-      foot:  LEN0.foot*scale
-    };
-    const WIDTH = {
-      thigh: Math.max(10, WIDTH0.thigh*scale),
-      shank: Math.max(8,  WIDTH0.shank*scale),
-      foot:  Math.max(6,  WIDTH0.foot*scale)
-    };
-
+    const W = rect.width, H = rect.height;
     ctx.clearRect(0,0,W,H);
 
-    // Đặt hông ở trên, phần dưới luôn còn chỗ trống
-    const hipX = W/2, hipY = MARGIN_TOP;
+    // Scale theo panel để luôn full chiều cao
+    const marginTop = 60, marginBot = 80;
+    const total0 = LEN0.thigh + LEN0.shank + LEN0.foot;
+    const usableH = H - marginTop - marginBot;
+    const scale = Math.min(1.6, Math.max(usableH / total0, 0.6));
+
+    const LEN = {
+      thigh: LEN0.thigh * scale,
+      shank: LEN0.shank * scale,
+      foot:  LEN0.foot  * scale
+    };
+    const WIDTH = {
+      thigh: WIDTH0.thigh * scale,
+      shank: WIDTH0.shank * scale,
+      foot:  WIDTH0.foot  * scale
+    };
+
+    const hipX = W/2;
+    const hipY = marginTop;
 
     const hipRad   = (90 + hipDeg) * Math.PI/180;
     const kneeRad  = hipRad + (kneeDeg  * Math.PI/180);
@@ -894,43 +888,34 @@ document.getElementById('btnToggleSB').addEventListener('click', ()=>{
     const toeX   = ankleX + LEN.foot  * Math.cos(footRad);
     const toeY   = ankleY + LEN.foot  * Math.sin(footRad);
 
-    // Hông
-    ctx.fillStyle = "#6c757d";
-    ctx.beginPath(); ctx.arc(hipX, hipY, 9, 0, Math.PI*2); ctx.fill();
-
-    // Đùi – Cẳng – Bàn chân
-    drawCapsule(hipX, hipY, kneeX,  kneeY,  WIDTH.thigh, "#0d6efd");
+    // Đùi - cẳng - bàn
+    drawCapsule(hipX, hipY, kneeX, kneeY, WIDTH.thigh, "#0d6efd");
     drawCapsule(kneeX, kneeY, ankleX, ankleY, WIDTH.shank, "#1973d4");
-    drawCapsule(ankleX, ankleY, toeX,  toeY,  WIDTH.foot,  "#5aa0ff");
+    drawCapsule(ankleX, ankleY, toeX, toeY, WIDTH.foot, "#5aa0ff");
 
-    // Khớp
-    drawJoint(kneeX,  kneeY);
-    drawJoint(ankleX, ankleY, 7, 4);
+    drawJoint(hipX, hipY, 11,7);
+    drawJoint(kneeX, kneeY);
+    drawJoint(ankleX, ankleY, 8,5);
 
-    // Nhãn
     ctx.fillStyle = "#212529";
-    ctx.font = "14px system-ui";
-    ctx.fillText(`Hip: ${hipDeg.toFixed(1)}°`,   hipX - 70, hipY - 16);
-    ctx.fillText(`Knee: ${kneeDeg.toFixed(1)}°`, kneeX + 12, kneeY + 4);
-    ctx.fillText(`Ankle: ${ankleDeg.toFixed(1)}°`,ankleX + 12, ankleY + 4);
+    ctx.font = "16px system-ui";
+    ctx.fillText(`Hip: ${hipDeg.toFixed(1)}°`, hipX - 80, hipY - 20);
+    ctx.fillText(`Knee: ${kneeDeg.toFixed(1)}°`, kneeX + 15, kneeY + 6);
+    ctx.fillText(`Ankle: ${ankleDeg.toFixed(1)}°`, ankleX + 15, ankleY + 6);
 
-    // Badge dưới canvas (nếu có)
-    const elHip = document.getElementById("liveHip");
-    const elKnee = document.getElementById("liveKnee");
-    const elAnkle = document.getElementById("liveAnkle");
-    if (elHip)   elHip.textContent   = hipDeg.toFixed(1);
-    if (elKnee)  elKnee.textContent  = kneeDeg.toFixed(1);
-    if (elAnkle) elAnkle.textContent = ankleDeg.toFixed(1);
+    // Cập nhật badge
+    document.getElementById("liveHip").textContent   = hipDeg.toFixed(1);
+    document.getElementById("liveKnee").textContent  = kneeDeg.toFixed(1);
+    document.getElementById("liveAnkle").textContent = ankleDeg.toFixed(1);
   }
 
-  // Lần đầu + khi resize cửa sổ
   drawModel();
   window.addEventListener('resize', drawModel);
 
-  // Nhận dữ liệu realtime
+  // Nhận dữ liệu realtime IMU
   const sock = window.socket;
   if (sock) {
-    sock.on("imu_data", (msg) => {
+    sock.on("imu_data", msg=>{
       if (typeof msg.hip   === "number") hipDeg   = msg.hip;
       if (typeof msg.knee  === "number") kneeDeg  = msg.knee;
       if (typeof msg.ankle === "number") ankleDeg = msg.ankle;
@@ -938,8 +923,8 @@ document.getElementById('btnToggleSB').addEventListener('click', ()=>{
     });
   }
 
-  // Test nhanh: setDemo(hip,knee,ankle)
-  window.setDemo = (h=0,k=0,a=0)=>{ hipDeg=h; kneeDeg=k; ankleDeg=a; drawModel(); };
+  // test nhanh: setDemo(h,k,a)
+  window.setDemo=(h=10,k=30,a=-10)=>{hipDeg=h;kneeDeg=k;ankleDeg=a;drawModel();};
 })();
 </script>
 
@@ -1349,6 +1334,7 @@ if __name__ == "__main__":
         debug=True,
         allow_unsafe_werkzeug=True
     )
+
 
 
 
