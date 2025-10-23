@@ -816,6 +816,78 @@ document.getElementById('btnToggleSB').addEventListener('click', ()=>{
     if (!j.ok) alert(j.msg || "Không stop được phiên đo");
   });
 </script>
+<script>
+(function(){
+  const canvas = document.getElementById("angleCanvas");
+  if (!canvas) return;
+
+  const ctx  = canvas.getContext("2d");
+  let hipDeg = 0, kneeDeg = 0, ankleDeg = 0;
+
+  // (tuỳ chọn) scale HiDPI để nét sắc
+  const dpr  = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width  = Math.max(520, Math.round(rect.width  * dpr));
+  canvas.height = Math.max(360, Math.round(rect.height * dpr));
+  ctx.scale(dpr, dpr);
+
+  function drawModel() {
+    const W = Math.round(canvas.width  / dpr);
+    const H = Math.round(canvas.height / dpr);
+    ctx.clearRect(0, 0, W, H);
+
+    const hipX = W/2, hipY = 60;
+    const thigh = 120, shank = 120;
+
+    const hipRad  = (90 + hipDeg) * Math.PI/180;
+    const kneeRad = hipRad + (kneeDeg * Math.PI/180);
+
+    const kneeX = hipX + thigh * Math.cos(hipRad);
+    const kneeY = hipY + thigh * Math.sin(hipRad);
+    const ankleX = kneeX + shank * Math.cos(kneeRad);
+    const ankleY = kneeY + shank * Math.sin(kneeRad);
+
+    ctx.fillStyle = "#6c757d";
+    ctx.beginPath(); ctx.arc(hipX, hipY, 8, 0, Math.PI*2); ctx.fill();
+
+    ctx.strokeStyle = "#0d6efd";
+    ctx.lineWidth = 8; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(hipX, hipY); ctx.lineTo(kneeX, kneeY); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(kneeX, kneeY); ctx.lineTo(ankleX, ankleY); ctx.stroke();
+
+    ctx.fillStyle = "#0d6efd";
+    ctx.beginPath(); ctx.arc(kneeX,  kneeY,  6, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(ankleX, ankleY, 6, 0, Math.PI*2); ctx.fill();
+
+    ctx.fillStyle = "#212529";
+    ctx.font = "14px system-ui";
+    ctx.fillText(`Hip: ${hipDeg.toFixed(1)}°`, hipX - 70, hipY - 12);
+    ctx.fillText(`Knee: ${kneeDeg.toFixed(1)}°`, kneeX + 10, kneeY + 4);
+
+    const elHip = document.getElementById("liveHip");
+    const elKnee = document.getElementById("liveKnee");
+    const elAnkle = document.getElementById("liveAnkle");
+    if (elHip)   elHip.textContent   = hipDeg.toFixed(1);
+    if (elKnee)  elKnee.textContent  = kneeDeg.toFixed(1);
+    if (elAnkle) elAnkle.textContent = ankleDeg.toFixed(1);
+  }
+
+  // Vẽ lần đầu để thấy mô hình ngay
+  drawModel();
+
+  // Nhận data realtime từ socket dùng chung
+  const sock = window.socket;
+  if (sock) {
+    sock.off && sock.off("imu_data"); // tránh đăng ký trùng khi reload
+    sock.on("imu_data", (msg) => {
+      if (typeof msg.hip   === "number") hipDeg   = msg.hip;
+      if (typeof msg.knee  === "number") kneeDeg  = msg.knee;
+      if (typeof msg.ankle === "number") ankleDeg = msg.ankle;
+      drawModel();
+    });
+  }
+})();
+</script>
 
 <script>
 (function(){
@@ -883,33 +955,8 @@ document.getElementById('btnToggleSB').addEventListener('click', ()=>{
     if (elKnee) elKnee.textContent = kneeDeg.toFixed(1);
     if (elAnkle) elAnkle.textContent = ankleDeg.toFixed(1);
   }
-
-  <script>
-(function(){
-  const canvas = document.getElementById("angleCanvas");
-  if (!canvas) return;
-
-  const ctx = canvas.getContext("2d");
-  let hipDeg = 0, kneeDeg = 0, ankleDeg = 0;
-
-  function drawModel(){ /* ...giữ nguyên như bạn... */ }
-
-  drawModel();
-
-  // DÙNG LẠI socket đã tạo
-  const sock = window.socket;
-  if (sock) {
-    sock.on("imu_data", (msg) => {
-      if (typeof msg.hip   === "number") hipDeg   = msg.hip;
-      if (typeof msg.knee  === "number") kneeDeg  = msg.knee;
-      if (typeof msg.ankle === "number") ankleDeg = msg.ankle;
-      drawModel();
-    });
-  }
-})();
+  
 </script>
-
-
 </body></html>
 """
 
@@ -1316,6 +1363,7 @@ if __name__ == "__main__":
         debug=True,
         allow_unsafe_werkzeug=True
     )
+
 
 
 
