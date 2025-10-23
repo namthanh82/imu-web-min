@@ -824,8 +824,9 @@ document.getElementById('btnToggleSB').addEventListener('click', ()=>{
   const ctx  = canvas.getContext("2d");
   let hipDeg = 0, kneeDeg = 0, ankleDeg = 0;
 
-  const LEN  = { thigh: 140, shank: 130, foot: 70 };
-  const WIDTH= { thigh: 18,  shank: 12,  foot: 10 };
+  // Kích thước “chuẩn” trước khi scale
+  const LEN0  = { thigh: 140, shank: 130, foot: 70 };
+  const WIDTH0= { thigh: 18,  shank: 12,  foot: 10 };
 
   function drawCapsule(x1, y1, x2, y2, w, color) {
     ctx.save();
@@ -838,7 +839,6 @@ document.getElementById('btnToggleSB').addEventListener('click', ()=>{
     ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
     ctx.restore();
   }
-
   function drawJoint(x, y, rOuter=8, rInner=5){
     ctx.save();
     ctx.fillStyle = "rgba(0,0,0,.15)";
@@ -849,10 +849,40 @@ document.getElementById('btnToggleSB').addEventListener('click', ()=>{
   }
 
   function drawModel() {
-    const W = canvas.width, H = canvas.height;
-    ctx.clearRect(0, 0, W, H);
+    const dpr  = window.devicePixelRatio || 1;
 
-    const hipX = W/2, hipY = 80;
+    // Làm canvas khớp bề rộng khung (giữ thuộc tính height=360 nhưng vẫn HiDPI)
+    const rect = canvas.getBoundingClientRect();
+    canvas.width  = Math.round(rect.width * dpr);
+    canvas.height = Math.round(360 * dpr);           // đúng với height attribute của bạn
+    ctx.setTransform(dpr,0,0,dpr,0,0);               // scale HiDPI
+    const W = Math.round(canvas.width / dpr);
+    const H = Math.round(canvas.height / dpr);
+
+    // Tính scale để KHÔNG tràn
+    const MARGIN_TOP = 60;
+    const MARGIN_BOT = 60; // chừa chỗ cho chữ/foot
+    const total0 = LEN0.thigh + LEN0.shank + LEN0.foot;
+    const maxDraw = Math.max(100, H - MARGIN_TOP - MARGIN_BOT);
+    const scale = Math.min(1, maxDraw / total0);
+
+    // Áp scale cho chiều dài & độ dày, có ngưỡng tối thiểu để không quá mảnh
+    const LEN   = {
+      thigh: LEN0.thigh*scale,
+      shank: LEN0.shank*scale,
+      foot:  LEN0.foot*scale
+    };
+    const WIDTH = {
+      thigh: Math.max(10, WIDTH0.thigh*scale),
+      shank: Math.max(8,  WIDTH0.shank*scale),
+      foot:  Math.max(6,  WIDTH0.foot*scale)
+    };
+
+    ctx.clearRect(0,0,W,H);
+
+    // Đặt hông ở trên, phần dưới luôn còn chỗ trống
+    const hipX = W/2, hipY = MARGIN_TOP;
+
     const hipRad   = (90 + hipDeg) * Math.PI/180;
     const kneeRad  = hipRad + (kneeDeg  * Math.PI/180);
     const footRad  = kneeRad + (ankleDeg * Math.PI/180);
@@ -864,24 +894,27 @@ document.getElementById('btnToggleSB').addEventListener('click', ()=>{
     const toeX   = ankleX + LEN.foot  * Math.cos(footRad);
     const toeY   = ankleY + LEN.foot  * Math.sin(footRad);
 
-    ctx.save();
+    // Hông
     ctx.fillStyle = "#6c757d";
     ctx.beginPath(); ctx.arc(hipX, hipY, 9, 0, Math.PI*2); ctx.fill();
-    ctx.restore();
 
+    // Đùi – Cẳng – Bàn chân
     drawCapsule(hipX, hipY, kneeX,  kneeY,  WIDTH.thigh, "#0d6efd");
     drawCapsule(kneeX, kneeY, ankleX, ankleY, WIDTH.shank, "#1973d4");
-    drawCapsule(ankleX, ankleY, toeX, toeY,  WIDTH.foot,  "#5aa0ff");
+    drawCapsule(ankleX, ankleY, toeX,  toeY,  WIDTH.foot,  "#5aa0ff");
 
+    // Khớp
     drawJoint(kneeX,  kneeY);
     drawJoint(ankleX, ankleY, 7, 4);
 
+    // Nhãn
     ctx.fillStyle = "#212529";
     ctx.font = "14px system-ui";
-    ctx.fillText(`Hip: ${hipDeg.toFixed(1)}°`,  hipX - 70, hipY - 16);
+    ctx.fillText(`Hip: ${hipDeg.toFixed(1)}°`,   hipX - 70, hipY - 16);
     ctx.fillText(`Knee: ${kneeDeg.toFixed(1)}°`, kneeX + 12, kneeY + 4);
-    ctx.fillText(`Ankle: ${ankleDeg.toFixed(1)}°`, ankleX + 12, ankleY + 4);
+    ctx.fillText(`Ankle: ${ankleDeg.toFixed(1)}°`,ankleX + 12, ankleY + 4);
 
+    // Badge dưới canvas (nếu có)
     const elHip = document.getElementById("liveHip");
     const elKnee = document.getElementById("liveKnee");
     const elAnkle = document.getElementById("liveAnkle");
@@ -890,10 +923,11 @@ document.getElementById('btnToggleSB').addEventListener('click', ()=>{
     if (elAnkle) elAnkle.textContent = ankleDeg.toFixed(1);
   }
 
-  // Vẽ lần đầu
+  // Lần đầu + khi resize cửa sổ
   drawModel();
+  window.addEventListener('resize', drawModel);
 
-  // Đăng ký socket **BÊN TRONG** IIFE, KHÔNG dùng sock.off để tránh xóa listener khác
+  // Nhận dữ liệu realtime
   const sock = window.socket;
   if (sock) {
     sock.on("imu_data", (msg) => {
@@ -904,10 +938,9 @@ document.getElementById('btnToggleSB').addEventListener('click', ()=>{
     });
   }
 
-  // tiện test từ Console: setDemo(hip,knee,ankle)
+  // Test nhanh: setDemo(hip,knee,ankle)
   window.setDemo = (h=0,k=0,a=0)=>{ hipDeg=h; kneeDeg=k; ankleDeg=a; drawModel(); };
-
-})();  // <-- chỉ đóng IIFE một lần
+})();
 </script>
 
 </body></html>
@@ -1316,6 +1349,7 @@ if __name__ == "__main__":
         debug=True,
         allow_unsafe_werkzeug=True
     )
+
 
 
 
