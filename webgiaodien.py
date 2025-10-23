@@ -19,7 +19,7 @@ serial_thread = None
 stop_serial_thread = False
 
 def start_serial_reader(port="COM5", baud=115200):
-    """Đọc dữ liệu serial: id,timestamp,yaw,roll,pitch"""
+    """Đọc dữ liệu serial: id,timestamp,yaw,roll,pitch (4 IMU, dùng pitch)."""
     global ser, serial_thread, stop_serial_thread
 
     import serial
@@ -30,39 +30,46 @@ def start_serial_reader(port="COM5", baud=115200):
         return False
 
     stop_serial_thread = False
-    last_angles = defaultdict(lambda: {"yaw":0,"roll":0,"pitch":0,"ts":0})
+    last_angles = defaultdict(lambda: {"yaw":0.0,"roll":0.0,"pitch":0.0,"ts":0.0})
+
+    def norm_deg(x):
+        while x > 180: x -= 360
+        while x < -180: x += 360
+        return x
 
     def reader_loop():
-        print(f"📡 Đang đọc dữ liệu từ {port} ...")
+        print(f" Đang đọc dữ liệu từ {port} ...")
+        needed = (1,2,3,4)
         while not stop_serial_thread:
             try:
-                line = ser.readline().decode("utf-8").strip()
+                line = ser.readline().decode("utf-8", errors="ignore").strip()
                 if not line:
                     continue
-
-                parts = line.split(",")
+                parts = line.split(",")  # id,ts,yaw,roll,pitch
                 if len(parts) < 5:
                     continue
 
-                sid = int(parts[0])
-                ts  = float(parts[1])
-                yaw = float(parts[2])
-                roll = float(parts[3])
+                sid   = int(float(parts[0]))
+                ts    = float(parts[1])
+                yaw   = float(parts[2])
+                roll  = float(parts[3])
                 pitch = float(parts[4])
 
-                # Lưu tạm góc của mỗi cảm biến
                 last_angles[sid] = {"yaw":yaw,"roll":roll,"pitch":pitch,"ts":ts}
 
-                # Nếu có đủ cả 3 ID (1,2,3) thì gom và emit
-                if all(k in last_angles for k in (1,2,3)):
-                    hip   = last_angles[1]["pitch"]
-                    knee  = last_angles[2]["pitch"]
-                    ankle = last_angles[3]["pitch"]
-                    t     = last_angles[1]["ts"]
+                # Khi đã có đủ 4 IMU → tính hip/knee/ankle từ pitch
+                if all(k in last_angles for k in needed):
+                    p1 = last_angles[1]["pitch"]
+                    p2 = last_angles[2]["pitch"]
+                    p3 = last_angles[3]["pitch"]
+                    p4 = last_angles[4]["pitch"]
 
-                    # Gọi append_samples (như trước)
+                    hip   = norm_deg(p1 - p2)
+                    knee  = norm_deg(p3 - p2)      # nếu bạn muốn p2 - p3, chỉ cần đổi thành norm_deg(p2 - p3)
+                    ankle = norm_deg(p3 - p4 - 90)
+
                     append_samples([{
-                        "t_ms": t,
+                        "t_ms": last_angles[1]["ts"],
                         "hip": hip,
                         "knee": knee,
                         "ankle": ankle
@@ -76,6 +83,7 @@ def start_serial_reader(port="COM5", baud=115200):
     serial_thread = threading.Thread(target=reader_loop, daemon=True)
     serial_thread.start()
     return True
+
 
 from flask import Flask, render_template_string, request, redirect, url_for, flash
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
@@ -241,7 +249,7 @@ def session_start():
     data_buffer = []
     if SERIAL_ENABLED:
         ok = start_serial_reader(
-            port=os.environ.get("SERIAL_PORT", "COM6"),
+            port=os.environ.get("SERIAL_PORT", "COM5"),
             baud=115200
         )
         if not ok:
@@ -1334,6 +1342,7 @@ if __name__ == "__main__":
         debug=True,
         allow_unsafe_werkzeug=True
     )
+
 
 
 
