@@ -801,7 +801,7 @@ document.getElementById('btnToggleSB').addEventListener('click', ()=>{
 </script>
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <script>
-  // ép dùng websocket để giảm trễ
+  // Ép websocket + tạo biến cục bộ 'socket'
   window.socket = window.socket || io({
     transports: ['websocket'],
     upgrade: false,
@@ -809,6 +809,8 @@ document.getElementById('btnToggleSB').addEventListener('click', ()=>{
     reconnectionAttempts: 10,
     reconnectionDelay: 500
   });
+  const socket = window.socket;
+
   // Nhận dữ liệu realtime & đổ vào bảng 3 cột đã có
   socket.on("imu_data", (msg) => {
     const tr = document.querySelector("#tblAngles tr");
@@ -820,6 +822,7 @@ document.getElementById('btnToggleSB').addEventListener('click', ()=>{
       if (msg.ankle != null) tds[2].textContent = Number(msg.ankle).toFixed(2);
     }
   });
+</script>
 
   // Gắn vào đúng 2 nút sẵn có
   const btnStart = document.getElementById("btnStart");
@@ -1390,7 +1393,6 @@ def stop_serial_reader():
             serial_thread.join(timeout=1.0)
         except: pass
     serial_thread = None
-@app.post("/api/imu")
 _last = {"hip":None, "knee":None, "ankle":None}
 ALPHA = 0.3 
 
@@ -1400,6 +1402,8 @@ def _smooth(key, val):
     else:
         _last[key] = _last[key]*(1-ALPHA) + val*ALPHA
     return _last[key]
+@app.post("/api/imu")
+
 
 def api_receive_imu():
     data = request.get_json(force=True) or {}
@@ -1437,6 +1441,7 @@ if __name__ == "__main__":
         debug=True,
         allow_unsafe_werkzeug=True
     )
+
 
 
 
