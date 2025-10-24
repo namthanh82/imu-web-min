@@ -1343,6 +1343,31 @@ def stop_serial_reader():
             serial_thread.join(timeout=1.0)
         except: pass
     serial_thread = None
+@app.post("/api/imu")
+def api_receive_imu():
+    data = request.get_json(force=True) or {}
+    p1, p2, p3, p4 = [data.get(k) for k in ("p1","p2","p3","p4")]
+
+    if None in (p1,p2,p3,p4):
+        return {"ok": False, "msg": "Thiếu dữ liệu"}, 400
+
+    def norm_deg(x):
+        while x > 180: x -= 360
+        while x < -180: x += 360
+        return x
+
+    hip   = norm_deg(p1 - p2)
+    knee  = norm_deg(p2 - p3)
+    ankle = norm_deg(p3 - p4 - 90)
+
+    append_samples([{
+        "t_ms": data.get("t_ms", time.time()*1000),
+        "hip": hip,
+        "knee": knee,
+        "ankle": ankle
+    }])
+
+    return {"ok": True}
 
 # ===================== Run =====================
 if __name__ == "__main__":
@@ -1353,6 +1378,7 @@ if __name__ == "__main__":
         debug=True,
         allow_unsafe_werkzeug=True
     )
+
 
 
 
