@@ -133,7 +133,14 @@ app = Flask(__name__)
 app.secret_key = "CHANGE_ME"   # nhớ đổi khi deploy
 PATIENTS_FILE = "sample.json"
 
-socketio = SocketIO(app, cors_allowed_origins="*")
+# chỗ khởi tạo SocketIO
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    ping_interval=10,   # giây
+    ping_timeout=30,    # giây
+)
+
 # ============ Emit dữ liệu realtime ============
 data_buffer = []
 
@@ -792,12 +799,16 @@ document.getElementById('btnToggleSB').addEventListener('click', ()=>{
   document.body.classList.toggle('sb-collapsed');
 });
 </script>
-<script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <script>
-  // Kết nối socket: GÁN vào window để tái dùng ở nơi khác
-  window.socket = window.socket || io();
-  const socket = window.socket;
-
+  // ép dùng websocket để giảm trễ
+  window.socket = window.socket || io({
+    transports: ['websocket'],
+    upgrade: false,
+    reconnection: true,
+    reconnectionAttempts: 10,
+    reconnectionDelay: 500
+  });
   // Nhận dữ liệu realtime & đổ vào bảng 3 cột đã có
   socket.on("imu_data", (msg) => {
     const tr = document.querySelector("#tblAngles tr");
@@ -827,16 +838,18 @@ document.getElementById('btnToggleSB').addEventListener('click', ()=>{
   });
 </script>
 <script>
-(function(){
+(function () {
   const canvas = document.getElementById("angleCanvas");
   if (!canvas) return;
   const ctx = canvas.getContext("2d");
+
   let hipDeg = 0, kneeDeg = 0, ankleDeg = 0;
 
-  // Kích thước gốc và tỷ lệ
+  // Kích thước nguyên mẫu (không quan trọng vì sẽ scale-fit)
   const LEN0  = { thigh: 160, shank: 150, foot: 80 };
   const WIDTH0= { thigh: 26,  shank: 18,  foot: 12 };
 
+  // Vẽ viên thuốc
   function drawCapsule(x1, y1, x2, y2, w, color) {
     ctx.save();
     ctx.lineCap = "round";
@@ -850,14 +863,31 @@ document.getElementById('btnToggleSB').addEventListener('click', ()=>{
   }
   function drawJoint(x, y, rOuter=10, rInner=6){
     ctx.save();
-    ctx.fillStyle = "rgba(0,0,0,.2)";
+    ctx.fillStyle = "rgba(0,0,0,.20)";
     ctx.beginPath(); ctx.arc(x, y, rOuter, 0, Math.PI*2); ctx.fill();
     ctx.fillStyle = "#0d6efd";
     ctx.beginPath(); ctx.arc(x, y, rInner, 0, Math.PI*2); ctx.fill();
     ctx.restore();
   }
 
-  function drawModel() {
+  // Tính toạ độ theo góc (trả về các điểm)
+  function computePoints() {
+    const hipRad  = (90 + hipDeg) * Math.PI/180;
+    const kneeRad = hipRad + (kneeDeg * Math.PI/180);
+    const footRad = kneeRad + (ankleDeg * Math.PI/180);
+
+    const hip = { x: 0, y: 0 };
+    const knee  = { x: hip.x + LEN0.thigh * Math.cos(hipRad),
+                    y: hip.y + LEN0.thigh * Math.sin(hipRad) };
+    const ankle = { x: knee.x + LEN0.shank * Math.cos(kneeRad),
+                    y: knee.y + LEN0.shank * Math.sin(kneeRad) };
+    const toe   = { x: ankle.x + LEN0.foot * Math.cos(footRad),
+                    y: ankle.y + LEN0.foot * Math.sin(footRad) };
+    return { hip, knee, ankle, toe };
+  }
+
+  // Fit tất cả điểm vào canvas (auto scale & center)
+  function fitAndDraw() {
     const dpr = window.devicePixelRatio || 1;
     const rect = canvas.getBoundingClientRect();
     canvas.width  = rect.width  * dpr;
@@ -867,74 +897,91 @@ document.getElementById('btnToggleSB').addEventListener('click', ()=>{
     const W = rect.width, H = rect.height;
     ctx.clearRect(0,0,W,H);
 
-    // Scale theo panel để luôn full chiều cao
-    const marginTop = 60, marginBot = 80;
-    const total0 = LEN0.thigh + LEN0.shank + LEN0.foot;
-    const usableH = H - marginTop - marginBot;
-    const scale = Math.min(1.6, Math.max(usableH / total0, 0.6));
+    const P = computePoints();
+    const xs = [P.hip.x, P.knee.x, P.ankle.x, P.toe.x];
+    const ys = [P.hip.y, P.knee.y, P.ankle.y, P.toe.y];
+    const minX = Math.min(...xs), maxX = Math.max(...xs);
+    const minY = Math.min(...ys), maxY = Math.max(...ys);
 
-    const LEN = {
-      thigh: LEN0.thigh * scale,
-      shank: LEN0.shank * scale,
-      foot:  LEN0.foot  * scale
-    };
+    const pad = 40; // padding trong khung
+    const bboxW = Math.max(1, maxX - minX);
+    const bboxH = Math.max(1, maxY - minY);
+
+    const scale = Math.min(
+      (W - 2*pad) / bboxW,
+      (H - 2*pad) / bboxH
+    );
+
+    // Tịnh tiến sao cho bbox vào giữa
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+
+    ctx.save();
+    ctx.translate(W/2, H/2);
+    ctx.scale(scale, scale);
+    ctx.translate(-cx, -cy);
+
+    // Độ dày segment cần scale để nhìn đẹp: lấy tỷ lệ theo scale nhưng clamp
+    const widthScale = Math.max(0.5, Math.min(1.5, scale / 1.2));
     const WIDTH = {
-      thigh: WIDTH0.thigh * scale,
-      shank: WIDTH0.shank * scale,
-      foot:  WIDTH0.foot  * scale
+      thigh: WIDTH0.thigh * widthScale,
+      shank: WIDTH0.shank * widthScale,
+      foot:  WIDTH0.foot  * widthScale
     };
 
-    const hipX = W/2;
-    const hipY = marginTop;
+    // Vẽ
+    drawCapsule(P.hip.x, P.hip.y, P.knee.x,  P.knee.y,  WIDTH.thigh, "#0d6efd");
+    drawCapsule(P.knee.x,P.knee.y,P.ankle.x,P.ankle.y, WIDTH.shank, "#1973d4");
+    drawCapsule(P.ankle.x,P.ankle.y,P.toe.x,  P.toe.y,  WIDTH.foot,  "#5aa0ff");
 
-    const hipRad   = (90 + hipDeg) * Math.PI/180;
-    const kneeRad  = hipRad + (kneeDeg  * Math.PI/180);
-    const footRad  = kneeRad + (ankleDeg * Math.PI/180);
+    drawJoint(P.hip.x, P.hip.y, 11,7);
+    drawJoint(P.knee.x, P.knee.y);
+    drawJoint(P.ankle.x, P.ankle.y, 8,5);
 
-    const kneeX  = hipX + LEN.thigh * Math.cos(hipRad);
-    const kneeY  = hipY + LEN.thigh * Math.sin(hipRad);
-    const ankleX = kneeX + LEN.shank * Math.cos(kneeRad);
-    const ankleY = kneeY + LEN.shank * Math.sin(kneeRad);
-    const toeX   = ankleX + LEN.foot  * Math.cos(footRad);
-    const toeY   = ankleY + LEN.foot  * Math.sin(footRad);
-
-    // Đùi - cẳng - bàn
-    drawCapsule(hipX, hipY, kneeX, kneeY, WIDTH.thigh, "#0d6efd");
-    drawCapsule(kneeX, kneeY, ankleX, ankleY, WIDTH.shank, "#1973d4");
-    drawCapsule(ankleX, ankleY, toeX, toeY, WIDTH.foot, "#5aa0ff");
-
-    drawJoint(hipX, hipY, 11,7);
-    drawJoint(kneeX, kneeY);
-    drawJoint(ankleX, ankleY, 8,5);
-
+    // Nhãn (đặt theo toạ độ mô hình rồi tự scale theo ctx)
     ctx.fillStyle = "#212529";
-    ctx.font = "16px system-ui";
-    ctx.fillText(`Hip: ${hipDeg.toFixed(1)}°`, hipX - 80, hipY - 20);
-    ctx.fillText(`Knee: ${kneeDeg.toFixed(1)}°`, kneeX + 15, kneeY + 6);
-    ctx.fillText(`Ankle: ${ankleDeg.toFixed(1)}°`, ankleX + 15, ankleY + 6);
+    ctx.font = `${14/Math.max(1, (1/scale))}px system-ui`; // text không quá to khi scale lớn
+    ctx.fillText(`Hip: ${hipDeg.toFixed(1)}°`, P.hip.x - 60, P.hip.y - 18);
+    ctx.fillText(`Knee: ${kneeDeg.toFixed(1)}°`, P.knee.x + 12, P.knee.y + 4);
+    ctx.fillText(`Ankle: ${ankleDeg.toFixed(1)}°`, P.ankle.x + 12, P.ankle.y + 4);
 
-    // Cập nhật badge
-    document.getElementById("liveHip").textContent   = hipDeg.toFixed(1);
-    document.getElementById("liveKnee").textContent  = kneeDeg.toFixed(1);
-    document.getElementById("liveAnkle").textContent = ankleDeg.toFixed(1);
+    ctx.restore();
+
+    // Badge dưới canvas
+    const eh=document.getElementById("liveHip");
+    const ek=document.getElementById("liveKnee");
+    const ea=document.getElementById("liveAnkle");
+    if (eh) eh.textContent = hipDeg.toFixed(1);
+    if (ek) ek.textContent = kneeDeg.toFixed(1);
+    if (ea) ea.textContent = ankleDeg.toFixed(1);
   }
 
-  drawModel();
-  window.addEventListener('resize', drawModel);
+  // Redraw mượt bằng rAF
+  let dirty = true;
+  function loop() {
+    if (dirty) {
+      fitAndDraw();
+      dirty = false;
+    }
+    requestAnimationFrame(loop);
+  }
+  loop();
+  window.addEventListener("resize", ()=>{ dirty = true; });
 
-  // Nhận dữ liệu realtime IMU
+  // Nhận realtime qua Socket.IO (đặt transport = websocket để giảm trễ)
   const sock = window.socket;
   if (sock) {
-    sock.on("imu_data", msg=>{
+    sock.off && sock.off("imu_data");
+    sock.on("imu_data", msg => {
       if (typeof msg.hip   === "number") hipDeg   = msg.hip;
       if (typeof msg.knee  === "number") kneeDeg  = msg.knee;
       if (typeof msg.ankle === "number") ankleDeg = msg.ankle;
-      drawModel();
+      dirty = true;
     });
   }
 
-  // test nhanh: setDemo(h,k,a)
-  window.setDemo=(h=10,k=30,a=-10)=>{hipDeg=h;kneeDeg=k;ankleDeg=a;drawModel();};
+  // test nhanh
+  window.setDemo = (h=10,k=30,a=-10)=>{ hipDeg=h;kneeDeg=k;ankleDeg=a; dirty=true; };
 })();
 </script>
 
@@ -1344,6 +1391,16 @@ def stop_serial_reader():
         except: pass
     serial_thread = None
 @app.post("/api/imu")
+_last = {"hip":None, "knee":None, "ankle":None}
+ALPHA = 0.3 
+
+def _smooth(key, val):
+    if _last[key] is None:
+        _last[key] = val
+    else:
+        _last[key] = _last[key]*(1-ALPHA) + val*ALPHA
+    return _last[key]
+
 def api_receive_imu():
     data = request.get_json(force=True) or {}
     p1, p2, p3, p4 = [data.get(k) for k in ("p1","p2","p3","p4")]
@@ -1359,7 +1416,9 @@ def api_receive_imu():
     hip   = norm_deg(p1 - p2)
     knee  = norm_deg(p2 - p3)
     ankle = norm_deg(p3 - p4 - 90)
-
+    hip   = _smooth("hip", hip)
+    knee  = _smooth("knee", knee)
+    ankle = _smooth("ankle", ankle)
     append_samples([{
         "t_ms": data.get("t_ms", time.time()*1000),
         "hip": hip,
@@ -1378,6 +1437,7 @@ if __name__ == "__main__":
         debug=True,
         allow_unsafe_werkzeug=True
     )
+
 
 
 
