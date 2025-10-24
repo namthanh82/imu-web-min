@@ -800,46 +800,46 @@ document.getElementById('btnToggleSB').addEventListener('click', ()=>{
 });
 </script>
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
-<script>
-  // Ép websocket + tạo biến cục bộ 'socket'
-  window.socket = window.socket || io({
-    transports: ['websocket'],
-    upgrade: false,
-    reconnection: true,
-    reconnectionAttempts: 10,
-    reconnectionDelay: 500
-  });
-  const socket = window.socket;
 
-  // Nhận dữ liệu realtime & đổ vào bảng 3 cột đã có
-  socket.on("imu_data", (msg) => {
-    const tr = document.querySelector("#tblAngles tr");
-    if (!tr) return;
-    const tds = tr.querySelectorAll("td");
-    if (tds.length >= 3) {
-      if (msg.hip   != null) tds[0].textContent = Number(msg.hip).toFixed(2);
-      if (msg.knee  != null) tds[1].textContent = Number(msg.knee).toFixed(2);
-      if (msg.ankle != null) tds[2].textContent = Number(msg.ankle).toFixed(2);
-    }
-  });
+<!-- Kết nối socket & gắn Start/Stop -->
+<script id="imu-handlers" type="text/javascript">
+// ép dùng websocket để giảm trễ
+window.socket = window.socket || io({
+  transports: ['websocket'],
+  upgrade: false,
+  reconnection: true,
+  reconnectionAttempts: 10,
+  reconnectionDelay: 500
+});
+const socket = window.socket;
+
+// Nhận dữ liệu realtime & đổ vào bảng
+socket.on("imu_data", (msg) => {
+  const tr = document.querySelector("#tblAngles tr");
+  if (!tr) return;
+  const tds = tr.querySelectorAll("td");
+  if (tds.length >= 3) {
+    if (msg.hip   != null) tds[0].textContent = Number(msg.hip).toFixed(2);
+    if (msg.knee  != null) tds[1].textContent = Number(msg.knee).toFixed(2);
+    if (msg.ankle != null) tds[2].textContent = Number(msg.ankle).toFixed(2);
+  }
+});
+
+// Gắn vào 2 nút sẵn có
+const btnStart = document.getElementById("btnStart");
+const btnStop  = document.getElementById("btnStop");
+if (btnStart) btnStart.addEventListener("click", async () => {
+  const r = await fetch("/session/start", { method: "POST" });
+  const j = await r.json();
+  if (!j.ok) alert(j.msg || "Không start được phiên đo");
+});
+if (btnStop) btnStop.addEventListener("click", async () => {
+  const r = await fetch("/session/stop", { method: "POST" });
+  const j = await r.json();
+  if (!j.ok) alert(j.msg || "Không stop được phiên đo");
+});
 </script>
 
-  // Gắn vào đúng 2 nút sẵn có
-  const btnStart = document.getElementById("btnStart");
-  const btnStop  = document.getElementById("btnStop");
-
-  if (btnStart) btnStart.addEventListener("click", async () => {
-    const r = await fetch("/session/start", { method: "POST" });
-    const j = await r.json();
-    if (!j.ok) alert(j.msg || "Không start được phiên đo");
-  });
-
-  if (btnStop) btnStop.addEventListener("click", async () => {
-    const r = await fetch("/session/stop", { method: "POST" });
-    const j = await r.json();
-    if (!j.ok) alert(j.msg || "Không stop được phiên đo");
-  });
-</script>
 <script>
 (function () {
   const canvas = document.getElementById("angleCanvas");
@@ -1441,6 +1441,7 @@ if __name__ == "__main__":
         debug=True,
         allow_unsafe_werkzeug=True
     )
+
 
 
 
