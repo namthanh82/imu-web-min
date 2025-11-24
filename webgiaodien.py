@@ -1,11 +1,58 @@
-
 # webgiaodien.py
-import os, json, time, csv
+import os, json, time
 from datetime import datetime
 import threading
 from collections import defaultdict
-# Chỉ bật đọc cổng COM khi chạy ở máy local (Render không có COM)
-SERIAL_ENABLED = os.environ.get("ENABLE_SERIAL", "0") == "1"
+import io, csv
+from flask import send_file  # thêm import này
+from flask import render_template_string
+
+data_buffer = []  # bộ đệm mẫu đo
+LAST_SESSION = []
+DATA_LOCK = threading.Lock()
+
+# Bật/tắt đọc cổng COM khi chạy local
+SERIAL_ENABLED = True  # ép bật serial
+
+MAX_LOCK = threading.Lock()
+MAX_ANGLES = {"hip": 0.0, "knee": 0.0, "ankle": 0.0}
+
+# ==== STATE & NGƯỠNG CHO HIP DÙNG PITCH2 ====
+HIP_STATE    = {"mode": "front", "prev_pitch2": 0.0}  # mode: 'front' hoặc 'back'
+PITCH_MID    = 90.0    # pitch2 ~ 90° là “biên” giữa trước / sau
+PITCH_HYS    = 10.0    # hysteresis: <80° chắc chắn là front, >100° chắc chắn là back
+HIP_CROSS_TH = 40.0    # chỉ đổi mode khi |hip thô| < 40°
+DEADZONE     = 2.0     # |hip| < 2° coi như 0 cho mượt
+# ============================================
+
+def reset_max_angles():
+    with MAX_LOCK:
+        MAX_ANGLES["hip"] = 0.0
+        MAX_ANGLES["knee"] = 0.0
+        MAX_ANGLES["ankle"] = 0.0
+
+
+# Dùng alias để tránh đè tên
+pyserial = None
+list_ports = None
+try:
+    if SERIAL_ENABLED:
+        import serial as pyserial
+        from serial.tools import list_ports
+except Exception:
+    SERIAL_ENABLED = False  # fallback
+
+
+def auto_detect_port():
+    if not list_ports:
+        return None
+    ports = list(list_ports.comports())
+    for p in ports:
+        if any(x in (p.description or "").upper() for x in ["USB", "ACM", "CP210", "CH340", "UART", "SERIAL"]):
+            return p.device
+    return ports[0].device if ports else None
+
+
 try:
     if SERIAL_ENABLED:
         import serial, serial.tools.list_ports  # cần pyserial
@@ -18,22 +65,37 @@ ser = None
 serial_thread = None
 stop_serial_thread = False
 
+
+# ==== Helpers toàn cục ====
+def norm_deg(x: float) -> float:
+    while x > 180:
+        x -= 360
+    while x < -180:
+        x += 360
+    return x
+
+
+def clamp(val, lo, hi):
+    return max(lo, min(hi, val))
+
+
 def start_serial_reader(port="COM5", baud=115200):
     """Đọc dữ liệu serial: id,timestamp,yaw,roll,pitch (4 IMU, dùng pitch)."""
     global ser, serial_thread, stop_serial_thread
 
-    if serial is None:
-        print("PySerial chưa sẵn sàng (SERIAL_ENABLED=0?).")
+    if not port:
+        print("Không tìm thấy cổng serial nào.")
         return False
 
     try:
-        ser = serial.Serial(port, baud, timeout=0.5)
+        ser = pyserial.Serial(port, baud, timeout=0.5)
+        print(f" Đã mở {port} @ {baud}")
     except Exception as e:
         print("Không mở được cổng serial:", e)
         return False
 
     stop_serial_thread = False
-    last_angles = defaultdict(lambda: {"yaw":0.0,"roll":0.0,"pitch":0.0,"ts":0.0})
+    last_angles = defaultdict(lambda: {"yaw": 0.0, "roll": 0.0, "pitch": 0.0, "ts": 0.0})
 
     def norm_deg(x: float) -> float:
         while x > 180: x -= 360
@@ -42,7 +104,11 @@ def start_serial_reader(port="COM5", baud=115200):
 
     def reader_loop():
         print(f" Đang đọc dữ liệu từ {port} @ {baud} ...")
-        needed = (1,2,3,4)
+        import re
+        CSV_PAT = re.compile(
+            r'^\s*(-?\d+(?:\.\d+)?)[,\s]+(\d+(?:\.\d+)?)[,\s]+(-?\d+(?:\.\d+)?)[,\s]+(-?\d+(?:\.\d+)?)[,\s]+(-?\d+(?:\.\d+)?)\s*$'
+        )
+
         while not stop_serial_thread:
             try:
                 raw = ser.readline()
@@ -52,36 +118,42 @@ def start_serial_reader(port="COM5", baud=115200):
                 if not line:
                     continue
 
-                # Kỳ vọng: id,timestamp,yaw,roll,pitch
-                parts = line.split(",")
-                if len(parts) < 5:
+                # Lọc rác: chỉ nhận đúng CSV 5 số
+                m = CSV_PAT.match(line)
+                if not m:
                     continue
 
-                sid   = int(float(parts[0]))
-                ts    = float(parts[1])
-                yaw   = float(parts[2])
-                roll  = float(parts[3])
-                pitch = float(parts[4])
+                sid = int(float(m.group(1)))
+                ts = float(m.group(2))
+                yaw = float(m.group(3))
+                roll = float(m.group(4))
+                pitch = float(m.group(5))
 
-                last_angles[sid] = {"yaw":yaw,"roll":roll,"pitch":pitch,"ts":ts}
+                last_angles[sid] = {
+                    "yaw": yaw, "roll": roll, "pitch": pitch, "ts": ts
+                }
 
-                # Khi đủ 4 IMU thì tính góc
-                if all(k in last_angles for k in needed):
-                    p1 = last_angles[1]["pitch"]
-                    p2 = last_angles[2]["pitch"]
-                    p3 = last_angles[3]["pitch"]
-                    p4 = last_angles[4]["pitch"]
+                # Cho hiển thị tạm khi có >=2 IMU (test), đủ 1-4 thì lấy tương ứng
+                p1 = last_angles.get(1, {}).get("roll", 0.0)
+                p2 = last_angles.get(2, {}).get("roll", 0.0)
+                p3 = last_angles.get(3, {}).get("roll", 0.0)
+                p4 = -last_angles.get(4, {}).get("roll", 0.0)
+                pitch2 = last_angles.get(2, {}).get("pitch", 0.0)  # ⭐ pitch của IMU2
+                # Góc thô (chưa xử lý đổi hướng hip)
+                raw_hip   = norm_deg(p2 - p1)
+                raw_knee  = norm_deg(p3 - p2)
+                raw_ankle = norm_deg(p4 - p3)
 
-                    hip   = norm_deg(p1 - p2)
-                    knee  = norm_deg(p2 - p3)       # <— CHUẨN THEO BẠN
-                    ankle = norm_deg(p3 - p4 - 90)  # <— CHUẨN THEO BẠN
+                # Gửi cả p2 để xử lý đổi dấu ở append_samples
+                append_samples([{
+                    "t_ms": ts or time.time() * 1000,
+                    "hip":   raw_hip,
+                    "knee":  raw_knee,
+                    "ankle": raw_ankle,
+                    "p2":    p2,
+                    "pitch2": pitch2
+                }])
 
-                    append_samples([{
-                        "t_ms": last_angles[1]["ts"] or time.time()*1000,
-                        "hip": hip,
-                        "knee": knee,
-                        "ankle": ankle
-                    }])
 
             except Exception as e:
                 print("Serial read error:", e)
@@ -93,7 +165,6 @@ def start_serial_reader(port="COM5", baud=115200):
     return True
 
 
-
 from flask import Flask, render_template_string, request, redirect, url_for, flash
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -103,14 +174,8 @@ from flask_socketio import SocketIO
 import firebase_admin
 from firebase_admin import credentials, firestore
 
+
 def find_firebase_key():
-    """
-    Tìm file firebase-key.json ở các nơi thường gặp:
-    - Render Secret Files: /etc/secrets/firebase-key.json
-    - Render biến RENDER_SECRETS_DIR
-    - Local: firebase-key.json đặt cạnh code
-    - GOOGLE_APPLICATION_CREDENTIALS (nếu có)
-    """
     candidates = [
         os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"),
         "/etc/secrets/firebase-key.json",
@@ -120,41 +185,147 @@ def find_firebase_key():
     for p in candidates:
         if p and os.path.isfile(p):
             return p
-    raise FileNotFoundError("firebase-key.json not found in expected locations.")
+    return None
 
-CRED_PATH = find_firebase_key()
-cred = credentials.Certificate(CRED_PATH)
-firebase_admin.initialize_app(cred)
-fs_client = firestore.client()
 
+fs_client = None
+try:
+    CRED_PATH = find_firebase_key()
+    if CRED_PATH:
+        cred = credentials.Certificate(CRED_PATH)
+        firebase_admin.initialize_app(cred)
+        fs_client = firestore.client()
+        print(" Firebase initialized")
+    else:
+        print("ℹ  Firebase key not found → chạy local không dùng Firestore")
+except Exception as e:
+    print("  Firebase init skipped:", e)
+    fs_client = None
 
 # ===================== App & Auth =====================
 app = Flask(__name__)
-app.secret_key = "CHANGE_ME"   # nhớ đổi khi deploy
+app.secret_key = "CHANGE_ME"  # nhớ đổi khi deploy
 PATIENTS_FILE = "sample.json"
 
 # chỗ khởi tạo SocketIO
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    ping_interval=10,   # giây
-    ping_timeout=30,    # giây
+    ping_interval=10,  # giây
+    ping_timeout=30,  # giây
+    async_mode="threading",
 )
+from flask_socketio import emit
 
-# ============ Emit dữ liệu realtime ============
-data_buffer = []
+
+@socketio.on('connect')
+def _on_connect():
+    print('[SOCKET] client connected')
+    emit('imu_data', {
+        "t": time.time() * 1000,
+        "hip": 0,
+        "knee": 0,
+        "ankle": 0
+    })
+
+
+@app.post("/session/mock")
+@login_required
+def session_mock():
+    for i in range(30):
+        append_samples([{
+            "t_ms": time.time() * 1000,
+            "hip": 10 + i * 0.5,
+            "knee": 20 + i * 0.3,
+            "ankle": -5 + i * 0.2,
+        }])
+        time.sleep(0.1)
+    return {"ok": True, "mode": "mock"}
+
 
 def append_samples(samples):
-    """Gửi dữ liệu IMU realtime sang client qua Socket.IO"""
-    global data_buffer
+    global data_buffer, HIP_STATE
+
     for s in samples:
-        data_buffer.append(s)
+        t_ms = s.get("t_ms", time.time() * 1000)
+
+        # Góc thô từ reader_loop
+        raw_hip = float(s.get("hip", 0.0))
+        knee    = float(s.get("knee", 0.0))
+        ankle   = float(s.get("ankle", 0.0))
+
+        p2      = float(s.get("p2", 0.0))
+        pitch2  = float(s.get("pitch2", 0.0))
+
+        # ====== DÙNG pitch2 ĐỂ CHỌN HƯỚNG HIP (với hysteresis + biên độ) ======
+        mode        = HIP_STATE.get("mode", "front")   # 'front' hoặc 'back'
+        prev_pitch2 = HIP_STATE.get("prev_pitch2", 0.0)
+
+        # Chỉ cho phép đổi mode khi chân gần thẳng (|raw_hip| nhỏ)
+        if abs(raw_hip) < HIP_CROSS_TH:
+            # pitch2 thấp hẳn → chắc chắn đang gập ra TRƯỚC
+            if pitch2 <= (PITCH_MID - PITCH_HYS):
+                mode = "front"
+            # pitch2 cao hẳn → chắc chắn đang gập ra SAU
+            elif pitch2 >= (PITCH_MID + PITCH_HYS):
+                mode = "back"
+            # nếu pitch2 nằm giữa [80,100] thì giữ nguyên mode cũ, tránh nhảy liên tục
+
+        HIP_STATE["mode"]        = mode
+        HIP_STATE["prev_pitch2"] = pitch2
+
+        sign_front = 1 if mode == "front" else -1
+
+        # Biên độ hip + deadzone quanh 0 cho mượt
+        mag_hip = abs(raw_hip)
+        if mag_hip < DEADZONE:
+            hip = 0.0
+        else:
+            hip = sign_front * mag_hip
+
+        # ====== CLAMP ======
+        hip   = clamp(hip,  -30.1, 122.1)
+        knee  = clamp(abs(knee),   0, 134)
+        ankle = clamp(abs(ankle), 36, 113)
+
+        # ====== LÀM MƯỢT ======
+        hip   = _smooth("hip", hip)
+        knee  = _smooth("knee", knee)
+        ankle = _smooth("ankle", ankle)
+
+        # ====== CẬP NHẬT MAX ======
+        with MAX_LOCK:
+            if hip   > MAX_ANGLES["hip"]:   MAX_ANGLES["hip"]   = hip
+            if knee  > MAX_ANGLES["knee"]:  MAX_ANGLES["knee"]  = knee
+            if ankle > MAX_ANGLES["ankle"]: MAX_ANGLES["ankle"] = ankle
+
+            max_payload = {
+                "maxHip":   MAX_ANGLES["hip"],
+                "maxKnee":  MAX_ANGLES["knee"],
+                "maxAnkle": MAX_ANGLES["ankle"],
+            }
+
+        # ====== LƯU BUFFER ======
+        with DATA_LOCK:
+            data_buffer.append({
+                "t_ms": t_ms,
+                "hip":  hip,
+                "knee": knee,
+                "ankle": ankle
+            })
+
+        # ====== EMIT RA UI ======
         socketio.emit("imu_data", {
-            "t": s.get("t_ms"),
-            "hip": s.get("hip"),
-            "knee": s.get("knee"),
-            "ankle": s.get("ankle"),
+            "t": t_ms,
+            "hip": hip,
+            "knee": knee,
+            "ankle": ankle,
+            **max_payload
         })
+
+
+
+
 
 login_manager = LoginManager(app)
 login_manager.login_view = "login"
@@ -164,21 +335,25 @@ USERS = {"komlab": generate_password_hash("123456")}  # đổi khi deploy
 # Map bài tập -> đường dẫn video (trong static/videos/)
 EXERCISE_VIDEOS = {
     "ankle flexion": "/static/videos/ankle flexion.mp4",
-    "hip flexion":   "/static/videos/hip flexion.mp4",
-    "knee flexion":  "/static/videos/knee flexion.mp4",
+    "hip flexion": "/static/videos/hip flexion.mp4",
+    "knee flexion": "/static/videos/knee flexion.mp4",
 }
+
 
 class User(UserMixin):
     def __init__(self, u): self.id = u
 
+
 @login_manager.user_loader
 def load_user(u): return User(u) if u in USERS else None
+
 
 # ===================== Patient helpers =====================
 def _ensure_patients_file():
     if not os.path.exists(PATIENTS_FILE):
         with open(PATIENTS_FILE, "w", encoding="utf-8") as f:
             json.dump({}, f, ensure_ascii=False, indent=2)
+
 
 def load_patients_rows():
     _ensure_patients_file()
@@ -197,6 +372,7 @@ def load_patients_rows():
         })
     rows = sorted(rows, key=lambda r: (r["full_name"] or "").lower())
     return rows, data
+
 
 def add_patient_to_file(full_name, national_id, dob, sex, weight, height):
     rows, raw = load_patients_rows()
@@ -222,23 +398,55 @@ def add_patient_to_file(full_name, national_id, dob, sex, weight, height):
         json.dump(raw, f, ensure_ascii=False, indent=2)
     return patient_code
 
+
 def gen_patient_code(full_name: str) -> str:
     last = (full_name.split()[-1] if full_name else "BN")
     base = "".join(ch for ch in last if ch.isalnum())
     suffix = datetime.now().strftime("%m%d%H%M")
     return f"{base}{suffix}"
 
+
 # ===================== Routes =====================
 @app.route("/login", methods=["GET", "POST"])
 def login():
+    error_message = None
+
     if request.method == "POST":
         u = request.form.get("username", "").strip()
         p = request.form.get("password", "")
+
         if u in USERS and check_password_hash(USERS[u], p):
             login_user(User(u))
             return redirect(url_for("dashboard"))
-        flash("Sai tài khoản hoặc mật khẩu", "danger")
-    return render_template_string(LOGIN_HTML)
+        else:
+            # Sai tài khoản hoặc mật khẩu → gửi xuống HTML
+            error_message = "Sai tài khoản hoặc mật khẩu"
+
+    return render_template_string(LOGIN_HTML, error_message=error_message)
+@app.route("/register", methods=["POST"])
+def register():
+    username = request.form.get("reg_username", "").strip()
+    pw1      = request.form.get("reg_password", "")
+    pw2      = request.form.get("reg_password2", "")
+
+    if not username or not pw1:
+        # thiếu dữ liệu → quay lại trang login
+        flash("Vui lòng nhập đầy đủ tài khoản và mật khẩu", "danger")
+        return redirect(url_for("login"))
+
+    if pw1 != pw2:
+        flash("Mật khẩu nhập lại không khớp", "danger")
+        return redirect(url_for("login"))
+
+    global USERS
+    if username in USERS:
+        flash("Tài khoản đã tồn tại", "danger")
+        return redirect(url_for("login"))
+
+    USERS[username] = generate_password_hash(pw1)
+    flash("Đăng ký thành công, vui lòng đăng nhập", "success")
+    return redirect(url_for("login"))
+
 
 @app.route("/logout")
 @login_required
@@ -246,35 +454,99 @@ def logout():
     logout_user()
     return redirect(url_for("login"))
 
+
 @app.route("/")
 @login_required
 def dashboard():
     return render_template_string(DASH_HTML, username=current_user.id, videos=EXERCISE_VIDEOS)
+
 
 @app.post("/session/start")
 @login_required
 def session_start():
     global data_buffer
     data_buffer = []
+    print(f"[SESSION] SERIAL_ENABLED={SERIAL_ENABLED}")
     if SERIAL_ENABLED:
-        ok = start_serial_reader(
-            port=os.environ.get("SERIAL_PORT", "COM5"),
-            baud=115200
-        )
+        port = "COM5"
+        baud = int(os.environ.get("SERIAL_BAUD", "115200"))
+        print(f"[SESSION] will open port={port} baud={baud}")
+        ok = start_serial_reader(port=port, baud=baud)
+        print(f"[SESSION] start_serial_reader ok={ok}")
         if not ok:
-            return {"ok": False, "msg": "Không mở được cổng serial"}, 500
-        return {"ok": True, "mode": "serial"}
+            return {"ok": False, "msg": f"Không mở được cổng serial (port={port})"}, 500
+        return {"ok": True, "mode": "serial", "port": port, "baud": baud}
     else:
-        # Trên Render (không có COM) vẫn trả ok để UI hoạt động
+        print("[SESSION] SERIAL is DISABLED → noserial mode")
         return {"ok": True, "mode": "noserial"}
+
+
+@app.get("/session/export_csv")
+@login_required
+def session_export_csv():
+    # chụp nhanh dữ liệu hiện có
+    with DATA_LOCK:
+        rows = list(data_buffer)
+
+    if not rows:
+        # Trả file rỗng nhưng có header để người dùng vẫn tải được
+        rows = []
+
+    # tạo CSV trong bộ nhớ
+    sio = io.StringIO()
+    w = csv.writer(sio)
+    w.writerow(["t_ms", "hip_deg", "knee_deg", "ankle_deg"])
+    for r in rows:
+        w.writerow([int(r.get("t_ms", 0)),
+                    f'{float(r.get("hip", 0)):.4f}',
+                    f'{float(r.get("knee", 0)):.4f}',
+                    f'{float(r.get("ankle", 0)):.4f}'])
+
+    data = io.BytesIO(sio.getvalue().encode("utf-8-sig"))  # BOM để Excel mở OK
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    n = len(rows)
+    filename = f"imu_{ts}_{n}rows.csv"
+    data.seek(0)
+    return send_file(
+        data,
+        mimetype="text/csv",
+        as_attachment=True,
+        download_name=filename,
+        max_age=0,
+    )
 
 
 @app.post("/session/stop")
 @login_required
 def session_stop():
+    global LAST_SESSION, data_buffer
+
+    # nếu đang đọc serial thì dừng
     if SERIAL_ENABLED:
         stop_serial_reader()
+
+    #  LƯU LẠI PHIÊN ĐO GẦN NHẤT ĐỂ VẼ BIỂU ĐỒ
+    LAST_SESSION = list(data_buffer)  # clone mảng
+    print(f"[SESSION STOP] saved {len(LAST_SESSION)} samples")
+
+    # xóa buffer để không bị lẫn vào lần đo sau
+    data_buffer.clear()
+
+    return {"ok": True, "msg": "Đã kết thúc phiên đo"}
+
+
+@app.post("/session/reset_max")
+@login_required
+def session_reset_max():
+    reset_max_angles()
+    # Phát lại max=0 để UI cập nhật ngay
+    socketio.emit("imu_data", {
+        "t": time.time() * 1000,
+        "hip": None, "knee": None, "ankle": None,
+        "maxHip": 0.0, "maxKnee": 0.0, "maxAnkle": 0.0
+    })
     return {"ok": True}
+
 
 @app.route("/patients")
 @login_required
@@ -282,16 +554,17 @@ def patients_list():
     rows, _ = load_patients_rows()
     return render_template_string(PATIENTS_LIST_HTML, rows=rows)
 
+
 @app.route("/patients/new", methods=["GET", "POST"])
 @login_required
 def patients_new():
     if request.method == "POST":
-        full_name   = request.form.get("full_name", "").strip()
+        full_name = request.form.get("full_name", "").strip()
         national_id = request.form.get("national_id", "").strip()
-        dob         = request.form.get("dob", "").strip()
-        sex         = request.form.get("sex", "").strip()
-        weight      = request.form.get("weight", "").strip()
-        height      = request.form.get("height", "").strip()
+        dob = request.form.get("dob", "").strip()
+        sex = request.form.get("sex", "").strip()
+        weight = request.form.get("weight", "").strip()
+        height = request.form.get("height", "").strip()
 
         if not full_name:
             flash("Vui lòng nhập Họ và tên", "danger")
@@ -302,17 +575,19 @@ def patients_new():
         return redirect(url_for("patients_list"))
     return render_template_string(PATIENT_NEW_HTML)
 
+
 @app.route("/patients/manage")
 @login_required
 def patients_manage():
     return render_template_string(PATIENTS_MANAGE_HTML)
 
+
 @app.route("/ports")
 @login_required
 def ports():
-    if serial is None:
+    if not list_ports:
         return {"ports": []}
-    items = [{"device": p.device, "desc": p.description} for p in serial.tools.list_ports.comports()]
+    items = [{"device": p.device, "desc": p.description} for p in list_ports.comports()]
     return {"ports": items}
 
 
@@ -321,6 +596,7 @@ def ports():
 def api_patients_all():
     rows, raw = load_patients_rows()
     return {"rows": rows, "raw": raw}
+
 
 @app.post("/api/patients")
 @login_required
@@ -336,8 +612,10 @@ def api_patients_save():
         code = gen_patient_code(full_name)
 
     sex = (data.get("gender") or "").strip()
-    if sex.lower().startswith("m"): sex = "Male"
-    elif sex.lower().startswith("f"): sex = "FeMale"
+    if sex.lower().startswith("m"):
+        sex = "Male"
+    elif sex.lower().startswith("f"):
+        sex = "FeMale"
 
     raw[code] = {
         "DateOfBirth": data.get("dob") or "",
@@ -353,6 +631,7 @@ def api_patients_save():
         json.dump(raw, f, ensure_ascii=False, indent=2)
     return {"ok": True, "patient_code": code}
 
+
 @app.delete("/api/patients/<code>")
 @login_required
 def api_patients_delete(code):
@@ -364,6 +643,7 @@ def api_patients_delete(code):
         return {"ok": True}
     return {"ok": False, "msg": "Không tìm thấy"}, 404
 
+
 @app.delete("/api/patients")
 @login_required
 def api_patients_clear_all():
@@ -371,44 +651,509 @@ def api_patients_clear_all():
         json.dump({}, f, ensure_ascii=False, indent=2)
     return {"ok": True}
 
+
 # ====== NEW: Trang Hiệu chuẩn kiểu lưới như ảnh ======
 @app.route("/calibration")
 @login_required
 def calibration():
-    return render_template_string(CALIBRATION_HTML, username=current_user.id)
+    open_guide = request.args.get("guide", "0") in ("1", "true", "yes")
+    return render_template_string(CALIBRATION_HTML, username=current_user.id, open_guide=open_guide)
+
 
 @app.route("/charts")
 @login_required
 def charts():
-    return "<h3 style='font-family:system-ui;padding:16px'>Trang Biểu đồ (đang phát triển)</h3>"
+    global LAST_SESSION
+
+    # Khi chưa có phiên đo
+    if not LAST_SESSION:
+        return render_template_string(
+            CHARTS_HTML,
+            username=current_user.id,
+            t_ms=[],
+            hip=[],
+            knee=[],
+            ankle=[]
+        )
+
+    rows = LAST_SESSION[:]
+    rows.sort(key=lambda x: x["t_ms"])  # 🔥 Quan trọng nhất
+
+    raw_t = [r["t_ms"] for r in rows]
+    hipArr = [r["hip"] for r in rows]
+    kneeArr = [r["knee"] for r in rows]
+    ankleArr = [r["ankle"] for r in rows]
+
+    t0 = raw_t[0]
+    t_ms = [round(t - t0, 2) / 10000 for t in raw_t]
+
+    return render_template_string(
+        CHARTS_HTML,
+        username=current_user.id,
+        t_ms=t_ms,
+        hip=hipArr,
+        knee=kneeArr,
+        ankle=ankleArr
+    )
+@app.route("/charts_emg")
+@login_required
+def charts_emg():
+    global LAST_SESSION
+
+    if not LAST_SESSION:
+        return render_template_string(
+            EMG_CHART_HTML,
+            username=current_user.id,
+            t_ms=[],
+            emg=[]
+        )
+
+    rows = LAST_SESSION[:]
+    rows.sort(key=lambda x: x["t_ms"])
+
+    raw_t = [r["t_ms"] for r in rows]
+    t0    = raw_t[0]
+    t_ms  = [round(t - t0, 2) / 10000 for t in raw_t]
+
+    # Sau này bạn chỉ cần lưu thêm key "emg" vào LAST_SESSION là tự hiện
+    emgArr = [r.get("emg", 0.0) for r in rows]
+
+    return render_template_string(
+        EMG_CHART_HTML,
+        username=current_user.id,
+        t_ms=t_ms,
+        emg=emgArr
+    )
+
 
 @app.route("/settings")
 @login_required
 def settings():
     return "<h3 style='font-family:system-ui;padding:16px'>Trang Cài đặt (đang phát triển)</h3>"
 
+
 # ===================== HTML =====================
 LOGIN_HTML = """
 <!doctype html><html lang="vi"><head>
+<link rel="icon" type="image/png" href="{{ url_for('static', filename='unnamed.png') }}">
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Đăng nhập IMU</title>
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-</head><body class="bg-light d-flex align-items-center" style="min-height:100vh">
-<div class="container"><div class="row justify-content-center"><div class="col-sm-10 col-md-6 col-lg-4">
-<div class="card shadow"><div class="card-body">
-<h4 class="mb-3 text-center">Đăng nhập hệ thống IMU</h4>
-{% with messages = get_flashed_messages(with_categories=true) %}
-  {% for c,m in messages %}<div class="alert alert-{{c}}">{{m}}</div>{% endfor %}
-{% endwith %}
-<form method="post">
-  <div class="mb-3"><label class="form-label">Tài khoản</label><input name="username" class="form-control" required></div>
-  <div class="mb-3"><label class="form-label">Mật khẩu</label><input name="password" type="password" class="form-control" required></div>
-  <button class="btn btn-primary w-100">Đăng nhập</button>
-</form>
-<hr><a class="btn btn-outline-secondary w-100" href="https://sites.google.com">← Trang giới thiệu</a>
 
-</div></div></div></div></div></body></html>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+
+<style>
+:root{
+  --card-bg: rgba(5, 10, 25, 0.95);
+  --neon-blue: #29d4ff;
+  --neon-pink: #ff4fd8;
+  --neon-purple: #7b5dff;
+}
+
+/* ===== NỀN VŨ TRỤ + LỚP PHỦ ===== */
+body{
+  min-height:100vh;
+  margin:0;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+
+  background-image: url("{{ url_for('static', filename='space_bg.jpg') }}");
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  position:relative;
+  overflow:hidden;
+}
+
+/* Lớp phủ làm tối + blur nhẹ để neon nổi hơn */
+body::before{
+  content:"";
+  position:fixed;
+  inset:0;
+  background: radial-gradient(circle at top, rgba(0,0,0,0.25), rgba(0,0,0,0.75));
+  backdrop-filter: blur(3px);
+  z-index:-2;
+}
+
+/* Một chút hạt sao bay mờ mờ */
+body::after{
+  content:"";
+  position:fixed;
+  inset:-50px;
+  background-image:
+    radial-gradient(circle at 10% 20%, rgba(255,255,255,0.12) 0, transparent 35%),
+    radial-gradient(circle at 80% 10%, rgba(144,224,255,0.18) 0, transparent 40%),
+    radial-gradient(circle at 60% 80%, rgba(255,192,203,0.16) 0, transparent 45%);
+  opacity:0.45;
+  mix-blend-mode:screen;
+  animation: nebulaMove 40s linear infinite;
+  z-index:-1;
+}
+
+@keyframes nebulaMove{
+  0%{ transform:translate3d(0,0,0) scale(1); }
+  50%{ transform:translate3d(-30px,10px,0) scale(1.02); }
+  100%{ transform:translate3d(0,0,0) scale(1); }
+}
+
+/* ===== KHỐI LOGIN NEON ===== */
+.login-wrap{
+  position:relative;
+  padding:3px;
+  border-radius:24px;
+  background:
+    linear-gradient(135deg, rgba(41,212,255,0.9), rgba(255,79,216,0.9));
+  box-shadow:
+    0 0 35px rgba(41,212,255,0.55),
+    0 0 65px rgba(255,79,216,0.5);
+  max-width:480px;
+  width:100%;
+}
+
+/* KHUNG ĐĂNG NHẬP BÊN TRONG */
+.login-card{
+  position:relative;
+  z-index:0;
+  border-radius:22px;
+  background: radial-gradient(circle at top, #101630 0%, #050a18 55%, #02040b 100%);
+  padding:26px 30px 24px;
+  color:#e6f3ff;
+  box-shadow: 0 22px 60px rgba(0,0,0,0.75) inset;
+  overflow:hidden;
+}
+
+/* Ô vuông xoay NEON bên trong khung */
+.login-card::before,
+.login-card::after{
+  content:"";
+  position:absolute;
+  width:230px;
+  height:230px;
+  border-radius:18px;
+  border:1.6px solid rgba(41,212,255,0.35);
+  box-shadow:0 0 24px rgba(41,212,255,0.25);
+  transform:rotate(25deg);
+  animation: spinSquare 22s linear infinite;
+  opacity:0.45;
+  pointer-events:none;
+  z-index:0;
+}
+.login-card::before{
+  top:-90px;
+  left:-70px;
+}
+.login-card::after{
+  bottom:-90px;
+  right:-80px;
+  border-color:rgba(255,79,216,0.45);
+  box-shadow:0 0 24px rgba(255,79,216,0.28);
+  animation-duration:30s;
+}
+
+@keyframes spinSquare{
+  0%{ transform:rotate(0deg); }
+  100%{ transform:rotate(360deg); }
+}
+
+/* LỚP CHỨA NỘI DUNG ĐỂ NỔI TRÊN HÌNH XOAY */
+.card-inner{
+  position:relative;
+  z-index:1;
+}
+
+/* Logo & tiêu đề */
+.login-logo-row{
+  display:flex;
+  justify-content:center;
+  align-items:center;
+  gap:26px;
+  margin-bottom:10px;
+}
+.login-logo{
+  width:70px; height:auto;
+  filter: drop-shadow(0 0 12px rgba(41,212,255,0.6));
+}
+.login-title{
+  font-size:1.3rem;
+  font-weight:800;
+  text-align:center;
+  letter-spacing:0.08em;
+  text-transform:uppercase;
+  margin-bottom:4px;
+  color:#f7fbff;
+  text-shadow:0 0 12px rgba(255,255,255,0.7), 0 0 22px rgba(41,212,255,0.8);
+}
+.login-subtitle{
+  font-size:.85rem;
+  text-align:center;
+  color:#99c9ff;
+  margin-bottom:18px;
+}
+
+/* Divider neon mảnh */
+.divider{
+  height:1px;
+  border-radius:999px;
+  background:linear-gradient(90deg, transparent, rgba(87,140,255,0.9), transparent);
+  box-shadow:0 0 10px rgba(87,140,255,0.9);
+  margin-bottom:18px;
+}
+
+/* Form */
+.form-label{
+  font-size:.84rem;
+  color:#9dbaf8;
+  margin-bottom:4px;
+}
+.form-control{
+  border-radius:999px;
+  border:1px solid rgba(90,130,255,0.65);
+  background:rgba(5,16,40,0.95);
+  color:#e9f2ff;
+  font-size:.95rem;
+  padding-inline:14px;
+  box-shadow:0 0 0 1px rgba(0,0,0,0.45) inset;
+}
+.form-control::placeholder{ color:#5d76a8; font-size:.85rem; }
+.form-control:focus{
+  border-color:var(--neon-blue);
+  box-shadow:0 0 0 .15rem rgba(41,212,255,0.45);
+  background:rgba(3,10,30,1);
+  color:#ffffff;
+}
+
+/* Nút con mắt */
+.btn-eye{
+  border-top-right-radius:999px;
+  border-bottom-right-radius:999px;
+  border-color:rgba(90,130,255,0.8);
+  background:linear-gradient(135deg,#07142d,#071d3d);
+  color:#a8c7ff;
+  font-size:.9rem;
+}
+.btn-eye:hover{
+  background:linear-gradient(135deg,#0b2446,#103263);
+  color:#ffffff;
+}
+
+/* Buttons */
+.btn-primary-neon{
+  border-radius:999px;
+  border:none;
+  font-weight:700;
+  font-size:.95rem;
+  background:linear-gradient(90deg,#00f0ff,#29b5ff);
+  color:#02111f;
+  box-shadow:
+    0 0 18px rgba(0,240,255,0.75),
+    0 0 36px rgba(0,167,255,0.85);
+}
+.btn-primary-neon:hover{
+  filter:brightness(1.1);
+  box-shadow:
+    0 0 22px rgba(0,240,255,0.9),
+    0 0 44px rgba(0,167,255,0.9);
+}
+.btn-secondary-neon{
+  border-radius:999px;
+  border:none;
+  font-weight:700;
+  font-size:.95rem;
+  background:linear-gradient(90deg,#ff4fd8,#ff8b7c);
+  color:#130014;
+  box-shadow:
+    0 0 18px rgba(255,79,216,0.75),
+    0 0 36px rgba(255,139,124,0.75);
+}
+.btn-secondary-neon:hover{
+  filter:brightness(1.05);
+  box-shadow:
+    0 0 22px rgba(255,79,216,0.9),
+    0 0 44px rgba(255,139,124,0.9);
+}
+
+/* Nút về trang giới thiệu */
+.btn-outline-ghost{
+  border-radius:999px;
+  border:1px solid rgba(160,185,255,0.6);
+  background:linear-gradient(90deg, rgba(3,10,32,0.9), rgba(5,14,40,0.95));
+  color:#c5d8ff;
+  font-weight:500;
+  font-size:.9rem;
+}
+.btn-outline-ghost:hover{
+  background:linear-gradient(90deg, rgba(6,18,54,0.95), rgba(8,24,70,0.98));
+  color:#ffffff;
+}
+
+/* Thông báo lỗi */
+.error-text{
+  font-size:.86rem;
+  color:#ff9bb7;
+  text-align:center;
+  margin-top:6px;
+}
+
+/* Đổi màu viền input trong form đăng ký một chút */
+#registerForm .form-control{
+  border-color:rgba(255,79,216,0.7);
+}
+#registerForm .form-control:focus{
+  border-color:#ff8bd6;
+  box-shadow:0 0 0 .15rem rgba(255,139,214,0.55);
+}
+
+/* Responsive nhỏ lại một tẹo trên mobile */
+@media (max-width:576px){
+  .login-card{ padding:22px 18px 20px; }
+  .login-title{ font-size:1.1rem; }
+}
+</style>
+</head>
+
+<body>
+
+<div class="login-wrap">
+  <div class="login-card">
+    <div class="card-inner">
+
+      <!-- LOGO -->
+      <div class="login-logo-row">
+        <img src="{{ url_for('static', filename='unnamed.png') }}" class="login-logo">
+        <img src="{{ url_for('static', filename='retrack.png') }}" class="login-logo">
+      </div>
+
+      <div class="login-title">HỆ THỐNG RETRACK</div>
+      <div class="login-subtitle">Nền tảng theo dõi & hỗ trợ phục hồi vận động KomLab</div>
+
+      <div class="divider"></div>
+
+      <!-- =================== FORM ĐĂNG NHẬP =================== -->
+      <form id="loginForm" method="post" action="/login">
+        <div class="mb-3">
+          <label class="form-label">Tài khoản</label>
+          <input name="username" class="form-control" placeholder="Nhập tài khoản..." required>
+        </div>
+
+        <div class="mb-3">
+          <label class="form-label">Mật khẩu</label>
+          <div class="input-group">
+            <input id="loginPassword" name="password" type="password" class="form-control" placeholder="Nhập mật khẩu..." required>
+            <button type="button" class="btn btn-eye toggle-password" data-target="loginPassword">👁‍🗨</button>
+          </div>
+        </div>
+
+        <div class="d-flex gap-2 mt-3">
+          <button class="btn btn-primary-neon flex-fill">Đăng nhập</button>
+          <button type="button" class="btn btn-secondary-neon flex-fill" id="btnShowRegister">Đăng ký</button>
+        </div>
+
+        {% if error_message %}
+        <div class="error-text">
+            {{ error_message }}
+        </div>
+        {% endif %}
+      </form>
+
+      <!-- =================== FORM ĐĂNG KÝ =================== -->
+      <form id="registerForm" method="post" action="/register" style="display:none; margin-top:4px;">
+        <div class="mb-2 text-center fw-semibold" style="color:#ffd3ff;">Tạo tài khoản mới</div>
+
+        <div class="mb-3">
+          <label class="form-label">Tài khoản</label>
+          <input name="reg_username" class="form-control" placeholder="" required>
+        </div>
+
+        <div class="mb-3">
+          <label class="form-label">Mật khẩu</label>
+          <div class="input-group">
+            <input id="regPassword" name="reg_password" type="password" class="form-control" required>
+            <button type="button" class="btn btn-eye toggle-password" data-target="regPassword">👁‍🗨</button>
+          </div>
+        </div>
+
+        <div class="mb-3">
+          <label class="form-label">Nhập lại mật khẩu</label>
+          <div class="input-group">
+            <input id="regPassword2" name="reg_password2" type="password" class="form-control" required>
+            <button type="button" class="btn btn-eye toggle-password" data-target="regPassword2">👁‍🗨</button>
+          </div>
+
+          <div id="pwError" class="error-text" style="display:none;">
+             Mật khẩu không khớp
+          </div>
+        </div>
+
+        <div class="d-flex gap-2 mt-2">
+          <button type="submit" class="btn btn-secondary-neon flex-fill">Đăng ký</button>
+          <button type="button" class="btn btn-outline-ghost flex-fill" id="btnShowLogin">← Đăng nhập</button>
+        </div>
+      </form>
+
+      <hr class="mt-4 mb-3" style="border-color:rgba(110,140,255,0.5);">
+
+      <a class="btn btn-outline-ghost w-100" href="https://sites.google.com/view/biotrackers/trang-ch%E1%BB%A7?authuser=2">← Về chúng tôi</a>
+
+    </div>
+  </div>
+</div>
+
+<!-- =================== SCRIPT =================== -->
+<script>
+  const loginForm    = document.getElementById('loginForm');
+  const registerForm = document.getElementById('registerForm');
+  const btnShowReg   = document.getElementById('btnShowRegister');
+  const btnShowLogin = document.getElementById('btnShowLogin');
+
+  // Chuyển qua form đăng ký
+  btnShowReg.addEventListener('click', () => {
+      loginForm.style.display = 'none';
+      registerForm.style.display = 'block';
+  });
+
+  // Quay lại đăng nhập
+  btnShowLogin.addEventListener('click', () => {
+      registerForm.style.display = 'none';
+      loginForm.style.display = 'block';
+  });
+
+  // Toggle hiển thị mật khẩu
+  document.querySelectorAll('.toggle-password').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const target = document.getElementById(btn.dataset.target);
+      const isHidden = target.type === 'password';
+      target.type = isHidden ? 'text' : 'password';
+      btn.textContent = isHidden ? "🔒" : "👁‍";
+    });
+  });
+
+  // Kiểm tra mật khẩu trùng nhau trong form đăng ký
+  const pw1 = document.getElementById('regPassword');
+  const pw2 = document.getElementById('regPassword2');
+  const pwError = document.getElementById('pwError');
+
+  function checkPw() {
+    if (!pw1.value || !pw2.value) {
+        pwError.style.display = "none";
+        return;
+    }
+    pwError.style.display = pw1.value !== pw2.value ? "block" : "none";
+  }
+
+  pw1.addEventListener("input", checkPw);
+  pw2.addEventListener("input", checkPw);
+
+  registerForm.addEventListener("submit", e => {
+    checkPw();
+    if (pwError.style.display === "block") e.preventDefault();
+  });
+</script>
+
+</body></html>
 """
+
 
 # ======= Patients List (Xem lại) – sidebar thu gọn kiểu hiệu chuẩn =======
 PATIENTS_LIST_HTML = """
@@ -418,14 +1163,16 @@ PATIENTS_LIST_HTML = """
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
 <style>
 :root{ --blue:#1669c9; --sbw:260px; }
-body{ background:#f7f9fc }
+
+/* NỀN giống các trang khác */
+body{ background:#e8f3ff; }
 
 /* Layout + sidebar đồng bộ */
 .layout{ display:flex; gap:16px; position:relative; }
 .sidebar{
   background:var(--blue); color:#fff;
   border-top-right-radius:16px; border-bottom-right-radius:16px;
-  padding:16px; width:var(--sbw); min-height:100%;
+  padding:16px; width:var(--sbw); min-height:100vh;
   box-sizing:border-box;
 }
 .sidebar-col{
@@ -452,25 +1199,26 @@ body{ background:#f7f9fc }
 .card{ border-radius:14px; box-shadow:0 8px 18px rgba(16,24,40,.06) }
 .table thead th{ background:#eef5ff; color:#0a3768 }
 .search{ border-radius:10px }
+
+/* Nút menu sidebar */
 .menu-btn{
   width:100%; display:block; background:#1973d4; border:none; color:#fff;
   padding:10px 12px; margin:8px 0; border-radius:12px; font-weight:600;
   text-align:left; text-decoration:none;
 }
 .menu-btn:hover{ background:#1f80ea; color:#fff }
-
-/* Compact */
-.compact .container-fluid{ max-width:1280px; margin-inline:auto; }
-.compact .row.g-3{ --bs-gutter-x:1rem; --bs-gutter-y:1rem; }
+.menu-btn.active{ background:#0f5bb0; }
 </style>
 </head>
-<body class="compact sb-collapsed">
+<body class="sb-collapsed">
 
 <nav class="navbar bg-white shadow-sm px-3">
   <div class="container-fluid d-flex align-items-center">
     <button id="btnToggleSB" class="btn me-2">☰</button>
     <span class="navbar-brand mb-0">Danh sách bệnh nhân</span>
-    <div class="ms-auto">
+    <div class="ms-auto d-flex align-items-center gap-2">
+      <a class="btn btn-primary px-3" href="/">Trang chủ</a>
+      <img src="{{ url_for('static', filename='unnamed.png') }}" height="40">
     </div>
   </div>
 </nav>
@@ -484,7 +1232,7 @@ body{ background:#f7f9fc }
         <a class="menu-btn" href="/">Trang chủ</a>
         <a class="menu-btn" href="/calibration">Hiệu chuẩn</a>
         <a class="menu-btn" href="/patients/manage">Thông tin bệnh nhân</a>
-        <a class="menu-btn" href="/patients">Xem lại</a>
+        <a class="menu-btn active" href="/patients">Xem lại</a>
         <a class="menu-btn" href="/charts">Biểu đồ</a>
         <a class="menu-btn" href="/settings">Cài đặt</a>
       </div>
@@ -549,31 +1297,52 @@ q.addEventListener('input', ()=>{
 });
 </script>
 </body></html>
-
 """
 
 
 PATIENT_NEW_HTML = """
 <!doctype html><html lang="vi"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Create new patient</title>
+<title>Thêm bệnh nhân mới</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
 <style>
-.card{ border-radius:16px; box-shadow:0 8px 20px rgba(16,24,40,.06) }
-.btn-outline-thick{ border:2px solid #151515; border-radius:12px; background:#fff; font-weight:600; }
-.form-label{ font-weight:600; color:#274b6d }
+body{
+  background:#e8f3ff;
+}
+
+.card{
+  border-radius:16px;
+  box-shadow:0 8px 20px rgba(16,24,40,.06);
+}
+.btn-outline-thick{
+  border:2px solid #151515;
+  border-radius:12px;
+  background:#fff;
+  font-weight:600;
+}
+.form-label{
+  font-weight:600;
+  color:#274b6d;
+}
 </style>
-</head><body class="bg-light">
+</head>
+<body>
+
 <nav class="navbar bg-white shadow-sm px-3">
   <div class="container-fluid">
     <span class="navbar-brand">Thêm bệnh nhân mới</span>
-    <div class="ms-auto"><a class="btn btn-outline-secondary" href="/patients">← Danh sách</a></div>
+    <div class="ms-auto d-flex align-items-center gap-2">
+      <a class="btn btn-outline-secondary" href="/patients">← Danh sách</a>
+      <img src="{{ url_for('static', filename='unnamed.png') }}" height="40">
+    </div>
   </div>
 </nav>
 
 <div class="container my-3" style="max-width:720px">
   {% with messages = get_flashed_messages(with_categories=true) %}
-    {% for c,m in messages %}<div class="alert alert-{{c}}">{{m}}</div>{% endfor %}
+    {% for c,m in messages %}
+      <div class="alert alert-{{c}}">{{m}}</div>
+    {% endfor %}
   {% endwith %}
   <div class="card p-4">
     <form method="post">
@@ -618,16 +1387,22 @@ PATIENT_NEW_HTML = """
 </body></html>
 """
 
+
 # ======= Dashboard (sidebar ẩn, bấm ☰ để mở) =======
 DASH_HTML = """
 <!doctype html><html lang="vi"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>IMU Dashboard</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+
+<script type="importmap">
+{ "imports": { "three": "https://unpkg.com/three@0.154.0/build/three.module.js" } }
+</script>
+
 <style>
 :root{ --blue:#1669c9; --soft:#f3f7ff; --sbw:260px; --video-h:360px; }
 body{ background:#fafbfe }
-.layout{ display:flex; gap:16px; position:relative; }
+.layout{ display:flex; gap:16px; position:relative;overflow-x:hidden; }
 
 /* Sidebar */
 .sidebar{ background:var(--blue); color:#fff; border-top-right-radius:16px; border-bottom-right-radius:16px; padding:16px; width:var(--sbw); min-height:100%; box-sizing:border-box; }
@@ -639,7 +1414,7 @@ body{ background:#fafbfe }
 .sb-collapsed .sidebar{ padding:0; width:0; border-radius:0; }
 .sb-collapsed .sidebar *{ display:none; }
 
-.panel{ background:#fff; border-radius:16px; box-shadow:0 8px 20px rgba(16,24,40,.06); padding:16px; }
+.panel{ background:#fff; border-radius:16px; box-shadow:0 8px 20px rgba(16,24,40,.06); padding:16px;overflow:hidden; }
 .title-chip{ display:inline-block; background:#e6f2ff; border:2px solid #9ccaff; color:#073c74; padding:8px 14px; border-radius:14px; font-weight:800; }
 .table thead th{ background:#eef5ff; color:#083a6a }
 .btn-outline-thick{ border:2px solid #151515; border-radius:12px; background:#fff; font-weight:700; }
@@ -657,6 +1432,9 @@ body{ background:#fafbfe }
 
 .menu-btn{ width:100%; display:block; background:#1973d4; border:none; color:#fff; padding:10px 12px; margin:8px 0; border-radius:12px; font-weight:600; text-align:left; text-decoration:none; }
 .menu-btn:hover{ background:#1f80ea; color:#fff }
+
+/* nền khung three: xanh nhạt; muốn trắng đổi thành #ffffff */
+#threeMount{ background:#eaf2ff; }
 </style>
 </head>
 <body class="compact sb-collapsed">
@@ -664,7 +1442,7 @@ body{ background:#fafbfe }
   <div class="container-fluid d-flex align-items-center">
     <button id="btnToggleSB" class="btn me-2">☰</button>
     <span class="navbar-brand mb-0">Xin chào, {{username}}</span>
-    <div class="ms-auto d-flex align-items-center gap-3">
+    <div class="ms-auto d-flex align-items-center gap-2">
       <a class="btn btn-outline-secondary" href="/logout">Đăng xuất</a>
       <img src="{{ url_for('static', filename='unnamed.png') }}" alt="Logo" height="48">
     </div>
@@ -692,7 +1470,8 @@ body{ background:#fafbfe }
         <div class="col-lg-7">
           <div class="panel mb-3">
             <div class="d-flex gap-2">
-              <a class="btn btn-outline-thick flex-fill" href="/patients">Danh sách bệnh nhân</a>
+              <!-- Nút này được JS bắt sự kiện để mở modal -->
+              <a class="btn btn-outline-thick flex-fill" href="#" id="btnPatientList">Danh sách bệnh nhân</a>
               <a class="btn btn-outline-thick flex-fill" href="/patients/new">Thêm bệnh nhân mới</a>
             </div>
             <div class="mt-3 d-flex align-items-center gap-3">
@@ -714,12 +1493,35 @@ body{ background:#fafbfe }
         <div class="col-lg-5">
           <div class="panel mb-3">
             <div class="row g-2">
-              <div class="col-6"><label class="form-label">Họ và tên :</label><input class="form-control"></div>
-              <div class="col-6"><label class="form-label">Ngày sinh :</label><input type="date" class="form-control"></div>
-              <div class="col-6"><label class="form-label">CCCD :</label><input class="form-control"></div>
-              <div class="col-6"><label class="form-label">Giới tính :</label><select class="form-select"><option>Nam</option><option>Nữ</option><option>Khác</option></select></div>
-              <div class="col-6"><label class="form-label">Cân nặng :</label><input class="form-control"></div>
-              <div class="col-6"><label class="form-label">Chiều cao :</label><input class="form-control"></div>
+             <div class="col-6">
+               <label class="form-label">Họ và tên :</label>
+               <input id="pat_name" class="form-control">
+             </div>
+
+             <div class="col-6">
+               <label class="form-label">Ngày sinh :</label>
+               <input id="pat_dob" type="date" class="form-control">
+             </div>
+
+             <div class="col-6">
+               <label class="form-label">CCCD :</label>
+               <input id="pat_cccd" class="form-control">
+             </div>
+
+             <div class="col-6">
+               <label class="form-label">Giới tính :</label>
+               <input id="pat_gender" class="form-control">
+             </div>
+
+             <div class="col-6">
+               <label class="form-label">Cân nặng :</label>
+               <input id="pat_weight" class="form-control">
+             </div>
+
+             <div class="col-6">
+               <label class="form-label">Chiều cao :</label>
+               <input id="pat_height" class="form-control">
+              </div>
               <div class="col-8"><label class="form-label">Bài kiểm tra :</label>
                 <div class="input-group">
                   <select class="form-select" id="exerciseSelect">
@@ -739,57 +1541,109 @@ body{ background:#fafbfe }
           </video>
         </div>
 
-       <!-- MÔ PHỎNG GÓC GẬP 2D (ở TRÊN) -->
-<div class="col-lg-7 pull-up-guide">
-  <div class="panel">
-    <div class="d-flex align-items-center justify-content-between mb-2">
-      <span class="title-chip">MÔ PHỎNG GÓC GẬP 2D</span>
-      <div class="small text-muted">Nguồn: pitch từ IMU (đơn vị °)</div>
-    </div>
-    <canvas id="angleCanvas" width="520" height="400" style="width:100%;max-width:720px;display:block;margin:auto;"></canvas>
-    <div class="text-center mt-2">
-      <span class="badge text-bg-light border me-2">Hip: <span id="liveHip">--</span>°</span>
-      <span class="badge text-bg-light border me-2">Knee: <span id="liveKnee">--</span>°</span>
-      <span class="badge text-bg-light border">Ankle: <span id="liveAnkle">--</span>°</span>
-    </div>
-  </div>
-</div>
+        <!-- MÔ PHỎNG 3D -->
+        <div class="col-lg-7 pull-up-guide">
+          <div class="panel">
+            <div class="d-flex align-items-center justify-content-between mb-2">
+              <span class="title-chip">MÔ PHỎNG 3D</span>
+              <div class="small text-muted">Nguồn: hip/knee/ankle từ IMU (độ)</div>
+            </div>
 
-<!-- CỤM NÚT BẮT ĐẦU/KẾT THÚC/ LƯU (giữ nguyên) -->
-<div class="col-lg-5">
-  <div class="panel d-grid gap-3">
-    <button class="btn btn-outline-thick py-3" id="btnStart">Bắt đầu đo</button>
-    <button class="btn btn-outline-thick py-3" id="btnStop">Kết thúc đo</button>
-    <button class="btn btn-outline-thick py-3" id="btnSave">Lưu kết quả</button>
-  </div>
-</div>
+            <div id="threeMount"
+                 style="width:100%; height:480px; min-height:480px; border-radius:14px; overflow:visible; position:relative; position:relative; z-index:1;">
+            </div>
 
-<!-- HƯỚNG DẪN QUY TRÌNH ĐO (đưa XUỐNG DƯỚI) -->
-<div class="col-lg-12">
-  <div class="panel">
-    <div class="text-center mb-3"><span class="title-chip">HƯỚNG DẪN QUY TRÌNH ĐO</span></div>
-    <div class="row g-2">
-      <div class="col-md-3"><div class="panel">Bước 1: Hiệu chuẩn thiết bị</div></div>
-      <div class="col-md-3"><div class="panel">Bước 2: Lắp thiết bị</div></div>
-      <div class="col-md-3"><div class="panel">Bước 3: Kiểm tra kết nối</div></div>
-      <div class="col-md-3"><div class="panel">Bước 4: Tiến hành đo</div></div>
-    </div>
-  </div>
-</div>
+            <div class="text-center mt-2">
+              <span class="badge text-bg-light border me-2">Hip: <span id="liveHip">--</span>°</span>
+              <span class="badge text-bg-light border me-2">Knee: <span id="liveKnee">--</span>°</span>
+              <span class="badge text-bg-light border">Ankle: <span id="liveAnkle">--</span>°</span>
+            </div>
+
+            <div class="mt-3 text-center">
+               <button class="btn btn-outline-thick px-4 py-2" id="btnResetPose3D">Reset 3D</button>
+
+               <div class="small text-muted mt-2" id="status3D">
+                    Đang khởi tạo 3D…
+               </div>
+            </div>
+
+          </div>
+        </div>
+
+        <!-- NÚT -->
+        <div class="col-lg-5">
+          <div class="panel d-grid gap-3">
+            <button class="btn btn-outline-thick py-3" id="btnStart">Bắt đầu đo</button>
+            <button class="btn btn-outline-thick py-3" id="btnStop">Kết thúc đo</button>
+            <button class="btn btn-outline-thick py-3" id="btnSave">Lưu kết quả</button>
+          </div>
+        </div>
+
+        <!-- HƯỚNG DẪN -->
+        <div class="col-lg-12">
+          <div class="panel">
+            <div class="text-center mb-3"><span class="title-chip">HƯỚNG DẪN QUY TRÌNH ĐO</span></div>
+            <div class="row g-2">
+              <div class="col-md-3">
+                <a class="panel d-block text-decoration-none" href="/calibration?guide=1">Bước 1: Hiệu chuẩn thiết bị</a>
+              </div>
+              <div class="col-md-3"><div class="panel">Bước 2: Lắp thiết bị</div></div>
+              <div class="col-md-3"><div class="panel">Bước 3: Kiểm tra kết nối</div></div>
+              <div class="col-md-3"><div class="panel">Bước 4: Tiến hành đo</div></div>
+            </div>
+          </div>
+        </div>
 
       </div>
     </main>
   </div>
 </div>
 
+<!-- Modal chọn bệnh nhân -->
+<div class="modal fade" id="patientModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Danh sách bệnh nhân</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <input id="pm_search" class="form-control mb-2" placeholder="Tìm kiếm...">
+        <div class="table-responsive" style="max-height:400px;">
+          <table class="table table-hover align-middle mb-0">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Mã</th>
+                <th>Họ và tên</th>
+                <th>CCCD</th>
+                <th>Ngày sinh</th>
+                <th>Giới tính</th>
+              </tr>
+            </thead>
+            <tbody id="pm_body"></tbody>
+          </table>
+        </div>
+        <div class="small text-muted mt-2">Nhấp đúp vào 1 dòng để chọn bệnh nhân.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Bootstrap JS (để dùng Modal) -->
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+
 <script>
+// ===== Video hướng dẫn =====
 const videosMap = {{ videos|tojson }};
 const sel = document.getElementById('exerciseSelect');
 const vid = document.getElementById('guideVideo');
 function updateVideo() {
-  const key = sel.value, url = videosMap[key];
+  const key = sel.value;
+  let url = videosMap[key];
   if (!url) { vid.removeAttribute('src'); vid.load(); return; }
-  if (vid.src !== location.origin + url) { vid.src = url; vid.load(); }
+
+  if (vid.getAttribute('src') !== url) { vid.setAttribute('src', url); vid.load(); }
   vid.play().catch(()=>{});
 }
 sel.addEventListener('change', updateVideo);
@@ -798,198 +1652,372 @@ updateVideo();
 document.getElementById('btnToggleSB').addEventListener('click', ()=>{
   document.body.classList.toggle('sb-collapsed');
 });
-</script>
-<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 
-<!-- Kết nối socket & gắn Start/Stop -->
-<script id="imu-handlers" type="text/javascript">
-// ép dùng websocket để giảm trễ
-window.socket = window.socket || io({
-  transports: ['websocket'],
-  upgrade: false,
-  reconnection: true,
-  reconnectionAttempts: 10,
-  reconnectionDelay: 500
-});
-const socket = window.socket;
+/* ===== Modal chọn bệnh nhân & fill form bên phải ===== */
+let PAT_CACHE = null;
 
-// Nhận dữ liệu realtime & đổ vào bảng
-socket.on("imu_data", (msg) => {
-  const tr = document.querySelector("#tblAngles tr");
-  if (!tr) return;
-  const tds = tr.querySelectorAll("td");
-  if (tds.length >= 3) {
-    if (msg.hip   != null) tds[0].textContent = Number(msg.hip).toFixed(2);
-    if (msg.knee  != null) tds[1].textContent = Number(msg.knee).toFixed(2);
-    if (msg.ankle != null) tds[2].textContent = Number(msg.ankle).toFixed(2);
-  }
-});
+function fillPatientOnDashboard(rec){
+  document.getElementById('pat_name').value   = rec.name || "";
+  document.getElementById('pat_cccd').value   = rec.ID || "";
+  document.getElementById('pat_dob').value    = rec.DateOfBirth || "";
+  document.getElementById('pat_gender').value = rec.Gender || "";
+  document.getElementById('pat_weight').value = rec.Weight || "";
+  document.getElementById('pat_height').value = rec.Height || "";
+}
 
-// Gắn vào 2 nút sẵn có
-const btnStart = document.getElementById("btnStart");
-const btnStop  = document.getElementById("btnStop");
-if (btnStart) btnStart.addEventListener("click", async () => {
-  const r = await fetch("/session/start", { method: "POST" });
-  const j = await r.json();
-  if (!j.ok) alert(j.msg || "Không start được phiên đo");
-});
-if (btnStop) btnStop.addEventListener("click", async () => {
-  const r = await fetch("/session/stop", { method: "POST" });
-  const j = await r.json();
-  if (!j.ok) alert(j.msg || "Không stop được phiên đo");
-});
-</script>
-
-<script>
-(function () {
-  const canvas = document.getElementById("angleCanvas");
-  if (!canvas) return;
-  const ctx = canvas.getContext("2d");
-
-  let hipDeg = 0, kneeDeg = 0, ankleDeg = 0;
-
-  // Kích thước nguyên mẫu (không quan trọng vì sẽ scale-fit)
-  const LEN0  = { thigh: 160, shank: 150, foot: 80 };
-  const WIDTH0= { thigh: 26,  shank: 18,  foot: 12 };
-
-  // Vẽ viên thuốc
-  function drawCapsule(x1, y1, x2, y2, w, color) {
-    ctx.save();
-    ctx.lineCap = "round";
-    ctx.strokeStyle = "rgba(0,0,0,.08)";
-    ctx.lineWidth = w + 6;
-    ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
-    ctx.strokeStyle = color;
-    ctx.lineWidth = w;
-    ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
-    ctx.restore();
-  }
-  function drawJoint(x, y, rOuter=10, rInner=6){
-    ctx.save();
-    ctx.fillStyle = "rgba(0,0,0,.20)";
-    ctx.beginPath(); ctx.arc(x, y, rOuter, 0, Math.PI*2); ctx.fill();
-    ctx.fillStyle = "#0d6efd";
-    ctx.beginPath(); ctx.arc(x, y, rInner, 0, Math.PI*2); ctx.fill();
-    ctx.restore();
-  }
-
-  // Tính toạ độ theo góc (trả về các điểm)
-  function computePoints() {
-    const hipRad  = (90 + hipDeg) * Math.PI/180;
-    const kneeRad = hipRad + (kneeDeg * Math.PI/180);
-    const footRad = kneeRad + (ankleDeg * Math.PI/180);
-
-    const hip = { x: 0, y: 0 };
-    const knee  = { x: hip.x + LEN0.thigh * Math.cos(hipRad),
-                    y: hip.y + LEN0.thigh * Math.sin(hipRad) };
-    const ankle = { x: knee.x + LEN0.shank * Math.cos(kneeRad),
-                    y: knee.y + LEN0.shank * Math.sin(kneeRad) };
-    const toe   = { x: ankle.x + LEN0.foot * Math.cos(footRad),
-                    y: ankle.y + LEN0.foot * Math.sin(footRad) };
-    return { hip, knee, ankle, toe };
-  }
-
-  // Fit tất cả điểm vào canvas (auto scale & center)
-  function fitAndDraw() {
-    const dpr = window.devicePixelRatio || 1;
-    const rect = canvas.getBoundingClientRect();
-    canvas.width  = rect.width  * dpr;
-    canvas.height = rect.height * dpr;
-    ctx.setTransform(dpr,0,0,dpr,0,0);
-
-    const W = rect.width, H = rect.height;
-    ctx.clearRect(0,0,W,H);
-
-    const P = computePoints();
-    const xs = [P.hip.x, P.knee.x, P.ankle.x, P.toe.x];
-    const ys = [P.hip.y, P.knee.y, P.ankle.y, P.toe.y];
-    const minX = Math.min(...xs), maxX = Math.max(...xs);
-    const minY = Math.min(...ys), maxY = Math.max(...ys);
-
-    const pad = 40; // padding trong khung
-    const bboxW = Math.max(1, maxX - minX);
-    const bboxH = Math.max(1, maxY - minY);
-
-    const scale = Math.min(
-      (W - 2*pad) / bboxW,
-      (H - 2*pad) / bboxH
-    );
-
-    // Tịnh tiến sao cho bbox vào giữa
-    const cx = (minX + maxX) / 2;
-    const cy = (minY + maxY) / 2;
-
-    ctx.save();
-    ctx.translate(W/2, H/2);
-    ctx.scale(scale, scale);
-    ctx.translate(-cx, -cy);
-
-    // Độ dày segment cần scale để nhìn đẹp: lấy tỷ lệ theo scale nhưng clamp
-    const widthScale = Math.max(0.5, Math.min(1.5, scale / 1.2));
-    const WIDTH = {
-      thigh: WIDTH0.thigh * widthScale,
-      shank: WIDTH0.shank * widthScale,
-      foot:  WIDTH0.foot  * widthScale
-    };
-
-    // Vẽ
-    drawCapsule(P.hip.x, P.hip.y, P.knee.x,  P.knee.y,  WIDTH.thigh, "#0d6efd");
-    drawCapsule(P.knee.x,P.knee.y,P.ankle.x,P.ankle.y, WIDTH.shank, "#1973d4");
-    drawCapsule(P.ankle.x,P.ankle.y,P.toe.x,  P.toe.y,  WIDTH.foot,  "#5aa0ff");
-
-    drawJoint(P.hip.x, P.hip.y, 11,7);
-    drawJoint(P.knee.x, P.knee.y);
-    drawJoint(P.ankle.x, P.ankle.y, 8,5);
-
-    // Nhãn (đặt theo toạ độ mô hình rồi tự scale theo ctx)
-    ctx.fillStyle = "#212529";
-    ctx.font = `${14/Math.max(1, (1/scale))}px system-ui`; // text không quá to khi scale lớn
-    ctx.fillText(`Hip: ${hipDeg.toFixed(1)}°`, P.hip.x - 60, P.hip.y - 18);
-    ctx.fillText(`Knee: ${kneeDeg.toFixed(1)}°`, P.knee.x + 12, P.knee.y + 4);
-    ctx.fillText(`Ankle: ${ankleDeg.toFixed(1)}°`, P.ankle.x + 12, P.ankle.y + 4);
-
-    ctx.restore();
-
-    // Badge dưới canvas
-    const eh=document.getElementById("liveHip");
-    const ek=document.getElementById("liveKnee");
-    const ea=document.getElementById("liveAnkle");
-    if (eh) eh.textContent = hipDeg.toFixed(1);
-    if (ek) ek.textContent = kneeDeg.toFixed(1);
-    if (ea) ea.textContent = ankleDeg.toFixed(1);
-  }
-
-  // Redraw mượt bằng rAF
-  let dirty = true;
-  function loop() {
-    if (dirty) {
-      fitAndDraw();
-      dirty = false;
-    }
-    requestAnimationFrame(loop);
-  }
-  loop();
-  window.addEventListener("resize", ()=>{ dirty = true; });
-
-  // Nhận realtime qua Socket.IO (đặt transport = websocket để giảm trễ)
-  const sock = window.socket;
-  if (sock) {
-    sock.off && sock.off("imu_data");
-    sock.on("imu_data", msg => {
-      if (typeof msg.hip   === "number") hipDeg   = msg.hip;
-      if (typeof msg.knee  === "number") kneeDeg  = msg.knee;
-      if (typeof msg.ankle === "number") ankleDeg = msg.ankle;
-      dirty = true;
+function renderPatRows(rows){
+  const tbody = document.getElementById('pm_body');
+  tbody.innerHTML = "";
+  rows.forEach((r,i)=>{
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${i+1}</td>
+      <td>${r.code||""}</td>
+      <td>${r.full_name||""}</td>
+      <td>${r.national_id||""}</td>
+      <td>${r.dob||""}</td>
+      <td>${r.sex||""}</td>
+    `;
+    tr.addEventListener('dblclick', ()=>{
+      const rec = (PAT_CACHE.raw || {})[r.code] || {};
+      fillPatientOnDashboard(rec);
+      const modal = bootstrap.Modal.getInstance(document.getElementById('patientModal'));
+      modal && modal.hide();
     });
+    tbody.appendChild(tr);
+  });
+}
+
+document.getElementById('btnPatientList').addEventListener('click', async (e)=>{
+  e.preventDefault();
+  const tbody = document.getElementById('pm_body');
+  tbody.innerHTML = "<tr><td colspan='6'>Đang tải...</td></tr>";
+
+  try{
+    if (!PAT_CACHE){
+      const res = await fetch('/api/patients');
+      PAT_CACHE = await res.json();
+    }
+    renderPatRows(PAT_CACHE.rows || []);
+  }catch(err){
+    tbody.innerHTML = "<tr><td colspan='6'>Lỗi tải dữ liệu</td></tr>";
+    console.error(err);
   }
 
-  // test nhanh
-  window.setDemo = (h=10,k=30,a=-10)=>{ hipDeg=h;kneeDeg=k;ankleDeg=a; dirty=true; };
-})();
+  document.getElementById('pm_search').value = "";
+  const modal = new bootstrap.Modal(document.getElementById('patientModal'));
+  modal.show();
+});
+
+// search trong modal
+document.getElementById('pm_search').addEventListener('input', (e)=>{
+  const kw = e.target.value.toLowerCase();
+  const trs = document.querySelectorAll('#pm_body tr');
+  trs.forEach(tr=>{
+    tr.style.display = tr.innerText.toLowerCase().includes(kw) ? "" : "none";
+  });
+});
+</script>
+
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script type="module">
+  import * as THREE from 'https://unpkg.com/three@0.154.0/build/three.module.js';
+  window.THREE = THREE;
+  import { GLTFLoader } from 'https://unpkg.com/three@0.154.0/examples/jsm/loaders/GLTFLoader.js';
+  import { OrbitControls } from 'https://unpkg.com/three@0.154.0/examples/jsm/controls/OrbitControls.js';
+
+  const mount = document.getElementById('threeMount');
+  const statusEl = document.getElementById('status3D');
+
+  // Scene (nền xanh nhạt; muốn trắng: đổi 0xeaf2ff -> 0xffffff)
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0xeaf2ff);
+
+  // Camera
+  const camera = new THREE.PerspectiveCamera(55, 1, 0.1, 5000);
+  camera.position.set(0, 120, 260);
+
+  // Renderer
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(mount.clientWidth, mount.clientHeight);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.0;
+  mount.appendChild(renderer.domElement);
+  renderer.domElement.style.width  = "100%";
+  renderer.domElement.style.height = "100%";
+  renderer.domElement.style.display = "block";
+
+  // Lights
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.3));
+  const dir = new THREE.DirectionalLight(0xffffff, 1.1);
+  dir.position.set(2, 4, 2);
+  scene.add(dir);
+
+  // Controls
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.enablePan = false;
+  controls.enableRotate = false;
+
+  // Grid
+  const GRID_SIZE = 240;
+  const grid = new THREE.GridHelper(GRID_SIZE, 24, 0x999999, 0xcccccc);
+  grid.position.y = 0;
+  scene.add(grid);
+
+  // Resize
+  function resizeNow() {
+    const w = mount.clientWidth || 1;
+    const h = mount.clientHeight || 1;
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+    renderer.setSize(w, h, false);
+  }
+  new ResizeObserver(resizeNow).observe(mount);
+  window.addEventListener('resize', resizeNow);
+  resizeNow();
+
+  // Pivot
+  const legPivot = new THREE.Group();
+  legPivot.position.set(0, 0, 0);
+  scene.add(legPivot);
+  window.legPivot = legPivot;
+
+  // Load GLB
+  const loader = new GLTFLoader();
+  const GLB_URL = "{{ url_for('static', filename='models/leg_model.glb') }}";
+
+  loader.load(
+    GLB_URL,
+    (gltf) => {
+      const model = gltf.scene || gltf.scenes?.[0];
+      if (!model) { statusEl.textContent = "⚠️ GLB không có scene."; return; }
+
+      // Ẩn mesh tĩnh, chỉ giữ SkinnedMesh
+      window.SKINS = [];
+      model.traverse((o) => {
+        if (o.isSkinnedMesh) {
+          o.frustumCulled = false;
+          o.castShadow = o.receiveShadow = true;
+          window.SKINS.push(o);
+        } else if (o.isMesh) {
+          o.visible = false;
+        }
+      });
+
+      // Chuẩn hoá pose rồi bind lại
+      model.rotation.set(0, 0, 0);
+      model.scale.set(1, 1, 1);
+      model.updateMatrixWorld(true);
+      for (const sm of window.SKINS) {
+        sm.normalizeSkinWeights();
+        sm.skeleton.pose();
+        sm.skeleton.calculateInverses();
+        sm.bind(sm.skeleton);
+      }
+
+      legPivot.add(model);
+      legPivot.rotation.y = Math.PI;
+
+      // Fit vào khung & đặt chạm sàn
+      const box0 = new THREE.Box3().setFromObject(model);
+      const size0 = new THREE.Vector3(); box0.getSize(size0);
+      const center0 = new THREE.Vector3(); box0.getCenter(center0);
+      model.position.sub(center0);  // tâm về gốc
+      model.updateMatrixWorld(true);
+
+      const maxDim = Math.max(size0.x, size0.y, size0.z) || 1;
+      const TARGET = GRID_SIZE * 0.55;
+      const scale = TARGET / maxDim;
+      model.scale.setScalar(scale);
+      model.updateMatrixWorld(true);
+
+      const box1 = new THREE.Box3().setFromObject(model);
+      model.position.y += -box1.min.y;  // đặt chạm sàn
+      model.updateMatrixWorld(true);
+
+      const box2 = new THREE.Box3().setFromObject(model);
+      const c2 = box2.getCenter(new THREE.Vector3());
+      model.position.x -= c2.x;  // căn giữa X,Z
+      model.position.z -= c2.z;
+      model.updateMatrixWorld(true);
+
+      // Camera side-view
+      const sphere = new THREE.Sphere(); new THREE.Box3().setFromObject(model).getBoundingSphere(sphere);
+      const sideDist = sphere.radius * 2.2;
+      camera.position.set(sideDist, sphere.radius * 0.35, 0);
+      camera.lookAt(0, sphere.center.y, 0);
+      controls.target.set(0, sphere.center.y, 0);
+      controls.update();
+      controls.minDistance = sphere.radius * 0.8;
+      controls.maxDistance = sphere.radius * 3.0;
+
+      /* ====== ĐA-SKELETON: gom mọi bone trùng tên ====== */
+      const BONE_REG = new Map(); // name(lowercase) -> array of Bone
+      for (const sm of window.SKINS) {
+        for (const b of sm.skeleton.bones) {
+          const key = (b.name || '').toLowerCase();
+          if (!key) continue;
+          if (!BONE_REG.has(key)) BONE_REG.set(key, []);
+          BONE_REG.get(key).push(b);
+          if (!b.userData.bindQ) b.userData.bindQ = b.quaternion.clone();
+        }
+      }
+
+      // Sửa 3 tên dưới cho khớp với file của bạn nếu khác (vd mixamorig:LeftUpLeg/LeftLeg/LeftFoot)
+      const NAME_MAP = {
+        hip:   'thighL',
+        knee:  'shinL',
+        ankle: 'footL'
+      };
+
+      function getBones(joint) {
+        const key = (NAME_MAP[joint] || '').toLowerCase();
+        return BONE_REG.get(key) || [];
+      }
+
+      // Trục/chiều/offset (+ helper để bạn hiệu chỉnh trong Console)
+      const AXISVEC = { x:new THREE.Vector3(1,0,0), y:new THREE.Vector3(0,1,0), z:new THREE.Vector3(0,0,1) };
+      const AXIS =  { hip:'x', knee:'x', ankle:'x' };
+      const SIGN =  { hip: -1,  knee: 1,  ankle: 1  };
+      const OFF  =  { hip: 0,  knee: 0,  ankle: -90  };
+      const toRad = d => (Number(d)||0) * Math.PI/180;
+
+      window.setAxis   = (joint, axis, sign=1)=>{ AXIS[joint]=axis; SIGN[joint]=Math.sign(sign)||1; };
+      window.setOffset = (joint, deg)=>{ OFF[joint]=Number(deg)||0; };
+      window.dumpBones = ()=> Array.from(BONE_REG.keys());
+
+      function setJointDeg(joint, deg){
+        const bones = getBones(joint);
+        if (!bones.length) return;
+        const ax = AXISVEC[AXIS[joint]] || AXISVEC.x;
+        const qDelta = new THREE.Quaternion().setFromAxisAngle(ax, SIGN[joint]*toRad((OFF[joint]||0) + (Number(deg)||0)));
+        for (const b of bones) {
+          const q0 = b.userData.bindQ || b.quaternion;
+          b.quaternion.copy(q0).multiply(qDelta);
+        }
+      }
+
+      window.applyLegAngles = (hip, knee, ankle_real) => {
+        setJointDeg('hip',   hip);
+        setJointDeg('knee',  knee);
+        setJointDeg('ankle', ankle_real);
+      };
+
+      window.legReady = true;
+      if (window._pendingAngles) {
+        const a = window._pendingAngles; window._pendingAngles = null;
+        window.applyLegAngles(a.hip, a.knee, a.ankle);
+      }
+
+      // Reset 3D
+      document.getElementById('btnResetPose3D')?.addEventListener('click', () => {
+        for (const arr of BONE_REG.values())
+          for (const b of arr) if (b.userData.bindQ) b.quaternion.copy(b.userData.bindQ);
+      });
+
+      // Clipping
+      const bbox = new THREE.Box3().setFromObject(model);
+      const size = bbox.getSize(new THREE.Vector3());
+      const rad  = size.length() * 0.5 || 1;
+      camera.near = Math.max(0.1, rad * 0.01);
+      camera.far  = rad * 20;
+      camera.updateProjectionMatrix();
+
+      statusEl.textContent = "✅ Mô hình đã sẵn sàng";
+    },
+    (progress) => {
+      const percent = (progress.loaded / (progress.total || 1)) * 100;
+      statusEl.textContent = `Đang tải mô hình: ${percent.toFixed(0)}%`;
+    },
+    (err) => {
+      console.error("❌ Lỗi load GLB:", err);
+      statusEl.textContent = "❌ Không tải được mô hình 3D.";
+    }
+  );
+
+  // Render loop
+  function animate() {
+    requestAnimationFrame(animate);
+    controls.update();
+    renderer.render(scene, camera);
+  }
+  animate();
+
+  // API nhận góc từ ngoài
+  window.pushAngles = (hip, knee, ankle) => {
+    if (window.legReady && typeof window.applyLegAngles === "function") {
+      window.applyLegAngles(hip, knee, ankle);
+    } else {
+      window._pendingAngles = { hip, knee, ankle };
+    }
+  };
+</script>
+
+<!-- Socket & Start/Stop -->
+<script id="imu-handlers">
+  const btnSave = document.getElementById("btnSave");
+  if (btnSave) btnSave.addEventListener("click", () => {
+    window.open("/session/export_csv", "_blank");
+  });
+
+  window.socket = window.socket || io({
+    transports: ['websocket'],
+    upgrade: false,
+    reconnection: true,
+    reconnectionAttempts: 10,
+    reconnectionDelay: 500
+  });
+  const socket = window.socket;
+  socket.on('connect', () => console.log('[SOCKET] connected:', socket.id));
+  socket.on('connect_error', (err) => console.error('[SOCKET] connect_error:', err));
+  socket.on('disconnect', (r) => console.warn('[SOCKET] disconnected:', r));
+
+  socket.on("imu_data", (msg) => {
+    const tr = document.querySelector("#tblAngles tr");
+    if (tr) {
+      const tds = tr.querySelectorAll("td");
+      if (tds.length >= 3) {
+        if (msg.hip   != null) tds[0].textContent = Number(msg.hip).toFixed(2);
+        if (msg.knee  != null) tds[1].textContent = Number(msg.knee).toFixed(2);
+        if (msg.ankle != null) tds[2].textContent = Number(msg.ankle).toFixed(2);
+      }
+    }
+    if (msg.hip   != null) document.getElementById('liveHip').textContent   = Number(msg.hip).toFixed(1);
+    if (msg.knee  != null) document.getElementById('liveKnee').textContent  = Number(msg.knee).toFixed(1);
+    if (msg.ankle != null) document.getElementById('liveAnkle').textContent = Number(msg.ankle).toFixed(1);
+
+    const hip   = msg.hip   ?? 0;
+    const knee  = msg.knee  ?? 0;
+    const ankle = msg.ankle ?? 0;
+    if (typeof window.pushAngles === "function") {
+      window.pushAngles(hip, knee, ankle);
+    } else {
+      window._pendingAngles = { hip, knee, ankle };
+    }
+  });
+
+  const btnStart = document.getElementById("btnStart");
+  const btnStop  = document.getElementById("btnStop");
+  if (btnStart) btnStart.addEventListener("click", async () => {
+    const r = await fetch("/session/start", { method: "POST" });
+    const j = await r.json();
+    console.log("[START RESPONSE]", j);
+    if (!j.ok) alert(j.msg || "Không start được phiên đo");
+  });
+  if (btnStop) btnStop.addEventListener("click", async () => {
+    const r = await fetch("/session/stop", { method: "POST" });
+    const j = await r.json();
+    if (!j.ok) alert(j.msg || "Không stop được phiên đo");
+    if (j.ok) window.location.href = "/charts";
+  });
 </script>
 
 </body></html>
 """
+
 
 # ======= NEW: Calibration page =======
 CALIBRATION_HTML = """
@@ -999,44 +2027,117 @@ CALIBRATION_HTML = """
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
 <style>
 :root{ --blue:#1669c9; --sbw:260px; }
-body{ background:#f5f7fb }
-.layout{ display:flex; gap:16px; }
-.sidebar{ background:var(--blue); color:#fff; border-top-right-radius:16px; border-bottom-right-radius:16px; padding:16px; width:var(--sbw); min-height:100%; box-sizing:border-box; }
-.sidebar-col{ flex:0 0 var(--sbw); max-width:var(--sbw); transition:flex-basis .28s ease, max-width .28s ease; }
-.main-col{ flex:1 1 auto; min-width:0; }
-.sb-collapsed .sidebar-col{ flex-basis:0; max-width:0; }
-.sb-collapsed .sidebar{ padding:0; width:0; border-radius:0; }
-.sb-collapsed .sidebar *{ display:none; }
 
-#btnToggleSB{ border:2px solid #d8e6ff; border-radius:10px; background:#fff; padding:6px 10px; font-weight:700; }
-#btnToggleSB:hover{ background:#f4f8ff; }
-.menu-btn{ width:100%; display:block; background:#1973d4; border:none; color:#fff; padding:10px 12px; margin:8px 0; border-radius:12px; font-weight:600; text-align:left; text-decoration:none; }
-.menu-btn:hover{ background:#1f80ea; color:#fff }
-
-/* Bảng hiệu chuẩn dạng lưới */
-.cal-grid{ max-width:1200px; margin-inline:auto; }
-.cell{
-  height:56px; background:#fff; border:1px solid #e5e7ef; border-radius:10px;
-  display:flex; align-items:center; padding:0 14px; box-shadow:0 2px 8px rgba(16,24,40,.04);
+/* Nền + font giống các trang khác */
+body{
+  background:#e8f3ff;
+  margin:0;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
-.cell.title{ font-weight:600; background:#f8fbff; }
-.header{ font-weight:700; color:#0a3768; }
-.logo-wrap{ display:flex; justify-content:center; align-items:flex-start; height:100%; }
-.logo-wrap img{ max-width:160px; }
 
-@media (max-width:991.98px){
-  .cell{ height:48px; }
-  .logo-wrap{ justify-content:flex-start; }
+/* Bố cục & sidebar giống Patients/Charts */
+.layout{
+  display:flex;
+  gap:16px;
+  position:relative;
+}
+.sidebar{
+  background:var(--blue); color:#fff;
+  border-top-right-radius:16px;
+  border-bottom-right-radius:16px;
+  padding:16px;
+  width:var(--sbw);
+  min-height:100vh;
+  box-sizing:border-box;
+}
+.sidebar-col{
+  flex:0 0 var(--sbw);
+  max-width:var(--sbw);
+  transition:flex-basis .28s ease, max-width .28s ease, transform .28s ease;
+  will-change:flex-basis,max-width,transform;
+}
+.main-col{
+  flex:1 1 auto;
+  min-width:0;
+}
+
+/* Sidebar thu gọn khi bấm 3 gạch */
+.sb-collapsed .sidebar-col{
+  flex-basis:0;
+  max-width:0;
+  transform:translateX(-8px);
+}
+.sb-collapsed .sidebar{
+  padding:0;
+  width:0;
+  border-radius:0;
+}
+.sb-collapsed .sidebar *{
+  display:none;
+}
+
+/* Nút 3 gạch trên navbar */
+#btnToggleSB{
+  border:2px solid #d8e6ff;
+  border-radius:10px;
+  background:#fff;
+  padding:6px 10px;
+  font-weight:700;
+}
+#btnToggleSB:hover{ background:#f4f8ff; }
+
+/* Nút menu bên trái */
+.menu-btn{
+  width:100%;
+  display:block;
+  background:#1973d4;
+  border:none;
+  color:#fff;
+  padding:10px 12px;
+  margin:8px 0;
+  border-radius:12px;
+  font-weight:600;
+  text-align:left;
+  text-decoration:none;
+}
+.menu-btn:hover{ background:#1f80ea; color:#fff; }
+.menu-btn.active{ background:#0f5bb0; }
+
+/* Khung video chính giữa */
+.video-card{
+  background:#ffffff;
+  border-radius:18px;
+  box-shadow:0 10px 30px rgba(15,23,42,.16);
+  padding:18px 18px 22px;
+  max-width:1100px;
+  margin:24px auto 32px auto;  /* căn giữa */
+}
+.video-title{
+  font-weight:700;
+  color:#0a3768;
+  margin-bottom:12px;
+}
+.video-frame{
+  border-radius:16px;
+  overflow:hidden;
+  background:#000;
+}
+.video-frame video{
+  width:100%;
+  height:100%;
+  display:block;
 }
 </style>
 </head>
 <body class="sb-collapsed">
+
 <nav class="navbar bg-white shadow-sm px-3">
   <div class="container-fluid d-flex align-items-center">
     <button id="btnToggleSB" class="btn me-2">☰</button>
     <span class="navbar-brand mb-0">Xin chào, {{username}}</span>
-    <div class="ms-auto d-flex align-items-center gap-3">
+    <div class="ms-auto d-flex align-items-center gap-2">
       <a class="btn btn-outline-secondary" href="/logout">Đăng xuất</a>
+      <img src="{{ url_for('static', filename='unnamed.png') }}" alt="Logo" height="40">
     </div>
   </div>
 </nav>
@@ -1048,7 +2149,7 @@ body{ background:#f5f7fb }
       <div class="sidebar">
         <div class="mb-2 fw-bold">MENU</div>
         <a class="menu-btn" href="/">Trang chủ</a>
-        <a class="menu-btn" href="/calibration">Hiệu chuẩn</a>
+        <a class="menu-btn active" href="/calibration">Hiệu chuẩn</a>
         <a class="menu-btn" href="/patients/manage">Thông tin bệnh nhân</a>
         <a class="menu-btn" href="/patients">Xem lại</a>
         <a class="menu-btn" href="/charts">Biểu đồ</a>
@@ -1058,53 +2159,502 @@ body{ background:#f5f7fb }
 
     <!-- Main -->
     <main class="main-col">
-      <div class="cal-grid">
-        <!-- Header row -->
-        <div class="row g-2 mb-2">
-          <div class="col-2"><div class="cell header"> </div></div>
-          <div class="col"><div class="cell header">Sys</div></div>
-          <div class="col"><div class="cell header">Gyro</div></div>
-          <div class="col"><div class="cell header">Acc</div></div>
-          <div class="col"><div class="cell header">Mag</div></div>
+      <div class="video-card">
+        <div class="video-title">HƯỚNG DẪN HIỆU CHUẨN IMU</div>
+        <div class="video-frame ratio ratio-16x9">
+          <video autoplay loop muted controls playsinline>
+            <source src="{{ url_for('static', filename='videos/calibration_loop.mp4') }}" type="video/mp4">
+            Trình duyệt của bạn không hỗ trợ video.
+          </video>
         </div>
-
-        <!-- Rows IMU1..IMU4 -->
-        {% for idx in [1,2,3,4] %}
-        <div class="row g-2 mb-2">
-          <div class="col-2"><div class="cell title">IMU{{idx}}:</div></div>
-          <div class="col"><div class="cell" id="imu{{idx}}-sys"></div></div>
-          <div class="col"><div class="cell" id="imu{{idx}}-gyro"></div></div>
-          <div class="col"><div class="cell" id="imu{{idx}}-acc"></div></div>
-          <div class="col"><div class="cell" id="imu{{idx}}-mag"></div></div>
-        </div>
-        {% endfor %}
       </div>
     </main>
-
-    <!-- Logo phải -->
-    <aside class="d-none d-lg-block" style="width:220px">
-      <div class="logo-wrap">
-        <img src="/static/unnamed.png" alt="Logo">
-      </div>
-    </aside>
   </div>
 </div>
 
 <script>
-document.getElementById('btnToggleSB').addEventListener('click', ()=>{
+document.getElementById('btnToggleSB').addEventListener('click', () => {
   document.body.classList.toggle('sb-collapsed');
-});
-
-/* (Tùy chọn) Ví dụ nhồi dữ liệu trạng thái */
-const fake = ["Sₛ","OK","NG","--"];
-["1","2","3","4"].forEach(i=>{
-  ["sys","gyro","acc","mag"].forEach(k=>{
-    const el = document.getElementById(`imu${i}-${k}`);
-    if(el) el.textContent = ""; // để trống sẵn giống mockup
-  });
 });
 </script>
 </body></html>
+"""
+
+
+CHARTS_HTML = """<!doctype html> 
+<html lang="vi"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Biểu đồ góc khớp</title>
+
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+:root { --blue:#1669c9; --sbw:260px; }
+
+body{
+  background:#e8f3ff;
+  margin:0;
+}
+
+/* ===== Sidebar layout giống trang chủ ===== */
+.layout{ display:flex; gap:16px; position:relative; }
+
+.sidebar-col{
+  flex:0 0 var(--sbw);
+  max-width:var(--sbw);
+  transition:all .28s ease;
+}
+.sidebar{
+  background:var(--blue); color:#fff;
+  border-top-right-radius:16px;
+  border-bottom-right-radius:16px;
+  padding:16px;
+  min-height:100vh;
+}
+.main-col{ flex:1 1 auto; min-width:0; }
+
+/* Thu gọn */
+body.sb-collapsed .sidebar-col{
+  flex-basis:0 !important;
+  max-width:0 !important;
+}
+body.sb-collapsed .sidebar{
+  padding:0 !important;
+}
+body.sb-collapsed .sidebar *{
+  display:none;
+}
+
+/* Nút 3 gạch */
+#btnToggleSB{
+  border:2px solid #d8e6ff;
+  background:#fff;
+  border-radius:10px;
+  padding:6px 10px;
+  font-weight:700;
+}
+#btnToggleSB:hover{
+  background:#eef6ff;
+}
+
+/* Menu nút */
+.menu-btn{
+  width:100%;
+  display:block;
+  background:#1d74d8;
+  border:none;
+  color:#fff;
+  padding:10px 12px;
+  margin:8px 0;
+  border-radius:12px;
+  font-weight:600;
+  text-align:left;
+  text-decoration:none;
+}
+.menu-btn:hover{ background:#1f80ea; }
+.menu-btn.active{ background:#0f5bb0; }
+
+/* Card panel */
+.panel{
+  background:#fff;
+  border-radius:16px;
+  box-shadow:0 8px 20px rgba(16,24,40,0.10);
+  padding:16px;
+  margin-bottom:16px;
+}
+
+.chart-box{ height:260px; }
+
+/* Cột đánh giá */
+.eval-panel{
+  background:#ffffff;
+  border-radius:16px;
+  box-shadow:0 8px 20px rgba(15,23,42,.12);
+  padding:16px;
+}
+.eval-header{ font-weight:700; color:#0b3769; }
+.eval-item + .eval-item{
+  border-top:1px dashed #e2e8f0;
+  margin-top:10px;
+  padding-top:10px;
+}
+
+/* Hộp thang điểm & tổng kết */
+.score-box{
+  margin-top:14px;
+  padding:12px;
+  border-radius:12px;
+  background:#f8faff;
+  border:1px solid #dbe7ff;
+  box-shadow:0 4px 12px rgba(0,0,0,0.05);
+}
+.score-total{
+  font-size:1.4rem;
+  font-weight:700;
+  color:#0b3769;
+}
+.health-status{
+  font-weight:700;
+  font-size:1rem;
+}
+</style>
+</head>
+<body class="sb-collapsed">
+
+<!-- NAVBAR -->
+<nav class="navbar bg-white shadow-sm px-3">
+  <div class="container-fluid d-flex align-items-center">
+
+    <button id="btnToggleSB" class="btn me-2">☰</button>
+
+    <span class="navbar-brand mb-0">Xin chào, {{username}}</span>
+
+    <div class="ms-auto d-flex align-items-center gap-3">
+      <a class="btn btn-outline-secondary" href="/logout">Đăng xuất</a>
+      <img src="/static/unnamed.png" height="48">
+    </div>
+  </div>
+</nav>
+
+<div class="container-fluid my-3">
+  <div class="layout">
+
+    <!-- SIDEBAR -->
+    <aside class="sidebar-col">
+      <div class="sidebar">
+        <div class="mb-2 fw-bold">MENU</div>
+        <a class="menu-btn" href="/">Trang chủ</a>
+        <a class="menu-btn" href="/calibration">Hiệu chuẩn</a>
+        <a class="menu-btn" href="/patients/manage">Thông tin bệnh nhân</a>
+        <a class="menu-btn" href="/patients">Xem lại</a>
+        <a class="menu-btn active" href="/charts">Biểu đồ</a>
+        <a class="menu-btn" href="/settings">Cài đặt</a>
+      </div>
+    </aside>
+
+    <!-- MAIN CONTENT -->
+    <main class="main-col">
+      <div class="row g-3">
+
+        <!-- Biểu đồ -->
+        <div class="col-lg-9">
+          <div class="panel">
+            <div class="d-flex justify-content-between align-items-center">
+              <div>
+                <h5>Biểu đồ góc khớp theo thời gian</h5>
+                <div class="text-muted small">Phiên đo gần nhất, t_ms tính từ lúc bắt đầu phiên đo.</div>
+              </div>
+              <a class="btn btn-outline-primary btn-sm" href="/charts_emg">
+                Xem biểu đồ EMG
+              </a>
+            </div>
+          </div>
+
+          <div class="panel"><h6>Hip (độ)</h6><div class="chart-box"><canvas id="hipChart"></canvas></div></div>
+          <div class="panel"><h6>Knee (độ)</h6><div class="chart-box"><canvas id="kneeChart"></canvas></div></div>
+          <div class="panel"><h6>Ankle (độ)</h6><div class="chart-box"><canvas id="ankleChart"></canvas></div></div>
+        </div>
+
+        <!-- Đánh giá -->
+        <div class="col-lg-3">
+          <div class="eval-panel">
+            <div class="eval-header mb-2">Đánh giá từng góc khớp</div>
+
+            <div id="evalContent">
+              <div class="d-flex align-items-center justify-content-center py-4">
+                <div class="spinner-border text-primary me-2"></div>
+                <span class="small text-muted">Đang chờ dữ liệu phiên đo…</span>
+              </div>
+            </div>
+
+          </div>
+        </div>
+
+      </div>
+    </main>
+
+  </div>
+</div>
+
+<script>
+// ===== Toggle sidebar =====
+document.getElementById("btnToggleSB").onclick = () =>
+  document.body.classList.toggle("sb-collapsed");
+
+// ===== Data =====
+const t_ms   = {{ t_ms|tojson }};
+const hipArr = {{ hip|tojson }};
+const kneeArr= {{ knee|tojson }};
+const ankleArr={{ ankle|tojson }};
+const evalBox = document.getElementById("evalContent");
+
+// ===== Biểu đồ =====
+const commonOptions = {
+  responsive:true, maintainAspectRatio:false,
+  interaction:{ mode:"index", intersect:false },
+  plugins:{ legend:{ display:false }},
+  scales:{
+    x:{ title:{ display:true, text:"t (ms)" }},
+    y:{ title:{ display:true, text:"Góc (°)" }, min:0, max:120 }
+  }
+};
+
+function makeChart(id, arr){
+  new Chart(document.getElementById(id), {
+    type:"line",
+    data:{ labels:t_ms, datasets:[{data:arr, borderColor:"#1973d4", tension:0.15}]},
+    options:commonOptions
+  });
+}
+
+makeChart("hipChart", hipArr);
+makeChart("kneeChart", kneeArr);
+makeChart("ankleChart", ankleArr);
+
+// ===== Đánh giá =====
+function analyze(arr){
+  if(!arr || !arr.length)
+    return {has:false,status:"Chưa có dữ liệu",badge:"secondary",note:"Cần đo phiên mới.",rom:0,max:0,min:0,score:0};
+
+  let max=Math.max(...arr), min=Math.min(...arr), rom=max-min;
+  let status,badge,note;
+
+  if(rom>=60){ status="Tốt"; badge="success"; note="Biên độ vận động tốt."; }
+  else if(rom>=30){ status="Trung bình"; badge="warning"; note="Còn hạn chế, nên tập thêm."; }
+  else{ status="Thấp"; badge="danger"; note="Biên độ rất thấp, nên tham khảo bác sĩ."; }
+
+  // Thang điểm 0–10 theo ROM
+  let score = 0;
+  if(rom >= 60) score = 10;
+  else if(rom >= 50) score = 8;
+  else if(rom >= 40) score = 6;
+  else if(rom >= 30) score = 4;
+  else if(rom >= 20) score = 2;
+  else score = 1;
+
+  return {has:true,status,badge,note,rom,max,min,score};
+}
+
+if(t_ms.length>0){
+  function block(name, ev){
+    return `
+      <div class="eval-item">
+        <div class="d-flex justify-content-between">
+          <strong>${name}</strong>
+          <span class="badge bg-${ev.badge}">${ev.status}</span>
+        </div>
+        <div class="small text-muted mt-1">
+          Chênh lệch: ${ev.rom.toFixed(1)}° — Max ${ev.max.toFixed(1)}° / Min ${ev.min.toFixed(1)}°
+        </div>
+        <div class="small">${ev.note}</div>
+        <div class="small mt-1"><em>Điểm: <strong>${ev.score}/10</strong></em></div>
+      </div>`;
+  }
+
+  const hip=analyze(hipArr), knee=analyze(kneeArr), ankle=analyze(ankleArr);
+
+  // Chèn 3 block + hộp tổng điểm
+  evalBox.innerHTML =
+    block("Hip",hip) +
+    block("Knee",knee) +
+    block("Ankle",ankle) +
+    `
+    <div class="score-box mt-3">
+      <div class="mb-2 fw-bold text-primary">🎯 Đánh giá thang điểm</div>
+      <div>Hip: <strong>${hip.score}/10</strong></div>
+      <div>Knee: <strong>${knee.score}/10</strong></div>
+      <div>Ankle: <strong>${ankle.score}/10</strong></div>
+
+      <hr>
+
+      <div class="score-total text-center">
+        Tổng điểm: <span id="totalScore"></span>/30
+      </div>
+      <div class="text-center mt-2 health-status" id="healthStatus"></div>
+    </div>
+    `;
+
+  // ===== Tổng điểm & sức khỏe tổng quan =====
+  const total = hip.score + knee.score + ankle.score;
+  document.getElementById("totalScore").textContent = total;
+
+  let health = "";
+  if(total >= 25) health = "💙 Rất tốt — Biên độ vận động gần như bình thường.";
+  else if(total >= 18) health = " Khá — Vẫn cần cải thiện thêm.";
+  else if(total >= 12) health = " Trung bình — Nên tăng cường tập luyện.";
+  else health = "🔴 Thấp — Biên độ hạn chế, nên gặp chuyên gia phục hồi chức năng.";
+
+  document.getElementById("healthStatus").textContent = health;
+}
+</script>
+
+</body>
+</html>
+"""
+
+EMG_CHART_HTML = """<!doctype html>
+<html lang="vi"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Biểu đồ EMG</title>
+
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+:root { --blue:#1669c9; --sbw:260px; }
+
+body{
+  background:#e8f3ff;
+  margin:0;
+}
+
+.layout{ display:flex; gap:16px; position:relative; }
+
+.sidebar-col{
+  flex:0 0 var(--sbw);
+  max-width:var(--sbw);
+  transition:all .28s ease;
+}
+.sidebar{
+  background:var(--blue); color:#fff;
+  border-top-right-radius:16px;
+  border-bottom-right-radius:16px;
+  padding:16px;
+  min-height:100vh;
+}
+.main-col{ flex:1 1 auto; min-width:0; }
+
+body.sb-collapsed .sidebar-col{
+  flex-basis:0 !important;
+  max-width:0 !important;
+}
+body.sb-collapsed .sidebar{
+  padding:0 !important;
+}
+body.sb-collapsed .sidebar *{
+  display:none;
+}
+
+#btnToggleSB{
+  border:2px solid #d8e6ff;
+  background:#fff;
+  border-radius:10px;
+  padding:6px 10px;
+  font-weight:700;
+}
+#btnToggleSB:hover{
+  background:#eef6ff;
+}
+
+.menu-btn{
+  width:100%;
+  display:block;
+  background:#1d74d8;
+  border:none;
+  color:#fff;
+  padding:10px 12px;
+  margin:8px 0;
+  border-radius:12px;
+  font-weight:600;
+  text-align:left;
+  text-decoration:none;
+}
+.menu-btn:hover{ background:#1f80ea; }
+.menu-btn.active{ background:#0f5bb0; }
+
+.panel{
+  background:#fff;
+  border-radius:16px;
+  box-shadow:0 8px 20px rgba(16,24,40,0.10);
+  padding:16px;
+  margin-bottom:16px;
+}
+
+.chart-box{ height:420px; }
+</style>
+</head>
+<body class="sb-collapsed">
+
+<nav class="navbar bg-white shadow-sm px-3">
+  <div class="container-fluid d-flex align-items-center">
+    <button id="btnToggleSB" class="btn me-2">☰</button>
+    <span class="navbar-brand mb-0">Xin chào, {{username}}</span>
+    <div class="ms-auto d-flex align-items-center gap-3">
+      <a class="btn btn-outline-secondary" href="/logout">Đăng xuất</a>
+      <img src="/static/unnamed.png" height="48">
+    </div>
+  </div>
+</nav>
+
+<div class="container-fluid my-3">
+  <div class="layout">
+    <aside class="sidebar-col">
+      <div class="sidebar">
+        <div class="mb-2 fw-bold">MENU</div>
+        <a class="menu-btn" href="/">Trang chủ</a>
+        <a class="menu-btn" href="/calibration">Hiệu chuẩn</a>
+        <a class="menu-btn" href="/patients/manage">Thông tin bệnh nhân</a>
+        <a class="menu-btn" href="/patients">Xem lại</a>
+        <a class="menu-btn" href="/charts">Biểu đồ góc</a>
+        <a class="menu-btn active" href="/charts_emg">Biểu đồ EMG</a>
+        <a class="menu-btn" href="/settings">Cài đặt</a>
+      </div>
+    </aside>
+
+    <main class="main-col">
+      <div class="panel">
+        <div class="d-flex justify-content-between align-items-center">
+          <div>
+            <h5>Biểu đồ tín hiệu EMG</h5>
+            <div class="text-muted small">
+              Biên độ EMG theo thời gian (mV). Dùng cùng thời gian với phiên đo gần nhất.
+            </div>
+          </div>
+          <a class="btn btn-outline-primary btn-sm" href="/charts">← Biểu đồ góc khớp</a>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="chart-box">
+          <canvas id="emgChart"></canvas>
+        </div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<script>
+document.getElementById("btnToggleSB").onclick = () =>
+  document.body.classList.toggle("sb-collapsed");
+
+const t_ms  = {{ t_ms|tojson }};
+const emg   = {{ emg|tojson }};
+
+const options = {
+  responsive:true, maintainAspectRatio:false,
+  interaction:{ mode:"index", intersect:false },
+  plugins:{ legend:{ display:false }},
+  scales:{
+    x:{ title:{ display:true, text:"t (ms)" }},
+    y:{ title:{ display:true, text:"Biên độ EMG (mV)" } }
+  }
+};
+
+new Chart(document.getElementById("emgChart"), {
+  type:"line",
+  data:{
+    labels:t_ms,
+    datasets:[{ data:emg, borderColor:"#1973d4", tension:0.15 }]
+  },
+  options
+});
+</script>
+
+</body>
+</html>
 """
 
 # ===================== Patients Manage =====================
@@ -1116,14 +2666,14 @@ PATIENTS_MANAGE_HTML = """
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
 <style>
 :root{ --blue:#1669c9; --sbw:260px; }
-body{ background:#f7f9fc }
+body{ background:#e8f3ff; }
 
-/* Bố cục & sidebar giống trang Hiệu chuẩn */
+/* Bố cục & sidebar giống Trang chủ / Hiệu chuẩn */
 .layout{ display:flex; gap:16px; position:relative; }
 .sidebar{
   background:var(--blue); color:#fff;
   border-top-right-radius:16px; border-bottom-right-radius:16px;
-  padding:16px; width:var(--sbw); min-height:100%;
+  padding:16px; width:var(--sbw); min-height:100vh;
   box-sizing:border-box;
 }
 .sidebar-col{
@@ -1134,7 +2684,7 @@ body{ background:#f7f9fc }
 }
 .main-col{ flex:1 1 auto; min-width:0; }
 
-/* Mặc định THU GỌN hoàn toàn (như yêu cầu) */
+/* Mặc định THU GỌN (ẩn sidebar) */
 .sb-collapsed .sidebar-col{ flex-basis:0; max-width:0; transform:translateX(-8px); }
 .sb-collapsed .sidebar{ padding:0; width:0; border-radius:0; }
 .sb-collapsed .sidebar *{ display:none; }
@@ -1153,28 +2703,25 @@ body{ background:#f7f9fc }
 .table thead th{ background:#eef5ff; color:#083a6a }
 .input-sm{ height:36px; }
 
-/* Menu nút trong sidebar */
+/* Menu trong sidebar */
 .menu-btn{
   width:100%; display:block; background:#1973d4; border:none; color:#fff;
   padding:10px 12px; margin:8px 0; border-radius:12px; font-weight:600;
   text-align:left; text-decoration:none;
 }
 .menu-btn:hover{ background:#1f80ea; color:#fff }
-
-/* Compact cho trang */
-.compact .container-fluid{ max-width:1280px; margin-inline:auto; }
-.compact .row.g-3{ --bs-gutter-x:1rem; --bs-gutter-y:1rem; }
-.compact .btn-outline-thick{ padding:10px 14px; border-radius:10px; }
+.menu-btn.active{ background:#0f5bb0; }
 </style>
 </head>
-<body class="compact sb-collapsed">
+<body class="sb-collapsed">
 
 <nav class="navbar bg-white shadow-sm px-3">
   <div class="container-fluid d-flex align-items-center">
     <button id="btnToggleSB" class="btn me-2">☰</button>
     <span class="navbar-brand mb-0">Thông tin bệnh nhân</span>
-    <div class="ms-auto">
-      
+    <div class="ms-auto d-flex align-items-center gap-2">
+      <a class="btn btn-outline-secondary" href="/logout">Đăng xuất</a>
+      <img src="{{ url_for('static', filename='unnamed.png') }}" alt="Logo" height="40">
     </div>
   </div>
 </nav>
@@ -1187,7 +2734,7 @@ body{ background:#f7f9fc }
         <div class="mb-2 fw-bold">MENU</div>
         <a class="menu-btn" href="/">Trang chủ</a>
         <a class="menu-btn" href="/calibration">Hiệu chuẩn</a>
-        <a class="menu-btn" href="/patients/manage">Thông tin bệnh nhân</a>
+        <a class="menu-btn active" href="/patients/manage">Thông tin bệnh nhân</a>
         <a class="menu-btn" href="/patients">Xem lại</a>
         <a class="menu-btn" href="/charts">Biểu đồ</a>
         <a class="menu-btn" href="/settings">Cài đặt</a>
@@ -1236,8 +2783,8 @@ body{ background:#f7f9fc }
               </div>
 
               <div class="col-12 d-flex justify-content-center gap-4 mt-2">
-                <button id="btnSave" class="btn btn-outline-thick py-2 px-5 fs-5">💾 Lưu</button>
-                <button id="btnDelete" class="btn btn-outline-thick py-2 px-5 fs-5">🗑️ Xóa</button>
+                <button id="btnSave" class="btn btn-outline-thick py-2 px-5 fs-5">Lưu</button>
+                <button id="btnDelete" class="btn btn-outline-thick py-2 px-5 fs-5">Xóa</button>
               </div>
             </div>
           </div>
@@ -1274,12 +2821,12 @@ body{ background:#f7f9fc }
 </div>
 
 <script>
-/* Toggle sidebar: giống trang Hiệu chuẩn */
+// Toggle sidebar: giống các trang khác
 document.getElementById('btnToggleSB').addEventListener('click', ()=>{
   document.body.classList.toggle('sb-collapsed');
 });
 
-/* ===== Logic quản lý bệnh nhân (giữ nguyên) ===== */
+/* ===== Logic quản lý bệnh nhân ===== */
 let DATA = {rows:[], raw:{}};
 const $ = (id)=>document.getElementById(id);
 
@@ -1364,80 +2911,93 @@ loadAll();
 </body></html>
 """
 
+
+
+
 @app.route("/save_patient", methods=["POST"])
 def save_patient():
     data = request.get_json(force=True) or {}
-
-    # Lấy mã bệnh nhân hoặc tự sinh nếu thiếu
     code = data.get("code") or f"BN{int(time.time())}"
-
-    # Lưu vào Firestore
+    if fs_client is None:
+        return {"ok": True, "code": code, "note": "Firestore disabled (local mode)"}
     try:
         fs_client.collection("patients").document(code).set(data)
         return {"ok": True, "code": code}
     except Exception as e:
         print("Lỗi khi lưu Firestore:", e)
         return {"ok": False, "error": str(e)}, 500
-        
+
+
 def stop_serial_reader():
     global stop_serial_thread, ser, serial_thread
     stop_serial_thread = True
     try:
         if ser and ser.is_open:
             ser.close()
-    except: pass
+    except:
+        pass
     ser = None
     # chờ thread dừng (nhanh)
     if serial_thread and serial_thread.is_alive():
         try:
             serial_thread.join(timeout=1.0)
-        except: pass
+        except:
+            pass
     serial_thread = None
-_last = {"hip":None, "knee":None, "ankle":None}
-ALPHA = 0.3 
+
+
+_last = {"hip": None, "knee": None, "ankle": None}
+ALPHA = 0.3
+
 
 def _smooth(key, val):
+    global _last
     if _last[key] is None:
         _last[key] = val
     else:
-        _last[key] = _last[key]*(1-ALPHA) + val*ALPHA
+        _last[key] = _last[key] * (1 - ALPHA) + val * ALPHA
     return _last[key]
-@app.post("/api/imu")
 
 
+@app.post("/api/imu")  # <— ĐẶT NGAY TRƯỚC HÀM
 def api_receive_imu():
     data = request.get_json(force=True) or {}
-    p1, p2, p3, p4 = [data.get(k) for k in ("p1","p2","p3","p4")]
-
-    if None in (p1,p2,p3,p4):
+    p1, p2, p3, p4 = [data.get(k) for k in ("p1", "p2", "p3", "p4")]
+    if None in (p1, p2, p3, p4):
         return {"ok": False, "msg": "Thiếu dữ liệu"}, 400
 
-    def norm_deg(x):
-        while x > 180: x -= 360
-        while x < -180: x += 360
-        return x
+    # --- Giới hạn góc hợp lý theo sinh học ---
+    def clamp(val, lo, hi):
+        return max(lo, min(hi, val))
 
-    hip   = norm_deg(p1 - p2)
-    knee  = norm_deg(p2 - p3)
-    ankle = norm_deg(p3 - p4 - 90)
-    hip   = _smooth("hip", hip)
-    knee  = _smooth("knee", knee)
+    raw_hip = norm_deg(p2 - p1)
+    raw_knee = norm_deg(p3 - p2)
+    raw_ankle = norm_deg(p4 - p3)
+    hip = clamp_local(raw_hip, -40, 140)
+    knee = clamp_local(raw_knee, -10, 160)
+    ankle = clamp_local(raw_ankle, 0, 100)
+
+    # --- Làm mượt ---
+    hip = _smooth("hip", hip)
+    knee = _smooth("knee", knee)
     ankle = _smooth("ankle", ankle)
-    append_samples([{
-        "t_ms": data.get("t_ms", time.time()*1000),
-        "hip": hip,
-        "knee": knee,
-        "ankle": ankle
-    }])
 
+    append_samples([{
+        "t_ms": data.get("t_ms", time.time() * 1000),
+        "hip": hip, "knee": knee, "ankle": ankle
+    }])
     return {"ok": True}
+
 
 # ===================== Run =====================
 if __name__ == "__main__":
     socketio.run(
         app,
-        host="0.0.0.0",
+        host="127.0.0.1",
         port=int(os.environ.get("PORT", 8080)),
         debug=True,
         allow_unsafe_werkzeug=True
     )
+
+
+
