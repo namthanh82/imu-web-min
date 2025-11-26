@@ -206,6 +206,9 @@ except Exception as e:
 app = Flask(__name__)
 app.secret_key = "CHANGE_ME"  # nhớ đổi khi deploy
 PATIENTS_FILE = "sample.json"
+EXPORT_DIR = "exports"
+os.makedirs(EXPORT_DIR, exist_ok=True)
+
 
 # chỗ khởi tạo SocketIO
 socketio = SocketIO(
@@ -336,7 +339,7 @@ USERS = {"komlab": generate_password_hash("123456")}  # đổi khi deploy
 EXERCISE_VIDEOS = {
     "ankle flexion": "/static/videos/ankle flexion.mp4",
     "hip flexion": "/static/videos/hip flexion.mp4",
-    "knee flexion": "/static/videos/knee flexion.mp4",
+    "knee flexion": "/static/knee flexion.mp4",
 }
 
 
@@ -484,28 +487,80 @@ def session_start():
 @app.get("/session/export_csv")
 @login_required
 def session_export_csv():
-    # chụp nhanh dữ liệu hiện có
+    """
+    Xuất CSV cho phiên đo:
+      - Nếu đã bấm KẾT THÚC ĐO → dùng LAST_SESSION
+      - Nếu chưa kết thúc mà bấm export → dùng data_buffer
+      - Nếu có patient_code → gắn vào tên file + lưu link vào JSON bệnh nhân
+    """
+    global LAST_SESSION
+
+    patient_code = request.args.get("patient_code", "").strip()
+
     with DATA_LOCK:
-        rows = list(data_buffer)
+        if LAST_SESSION:
+            rows = list(LAST_SESSION)   # phiên đo gần nhất
+        else:
+            rows = list(data_buffer)    # dữ liệu đang đo (fallback)
 
     if not rows:
-        # Trả file rỗng nhưng có header để người dùng vẫn tải được
         rows = []
 
-    # tạo CSV trong bộ nhớ
+    # Tạo CSV text
     sio = io.StringIO()
     w = csv.writer(sio)
     w.writerow(["t_ms", "hip_deg", "knee_deg", "ankle_deg"])
     for r in rows:
-        w.writerow([int(r.get("t_ms", 0)),
-                    f'{float(r.get("hip", 0)):.4f}',
-                    f'{float(r.get("knee", 0)):.4f}',
-                    f'{float(r.get("ankle", 0)):.4f}'])
+        w.writerow([
+            int(r.get("t_ms", 0)),
+            f'{float(r.get("hip",   0)):.4f}',
+            f'{float(r.get("knee",  0)):.4f}',
+            f'{float(r.get("ankle", 0)):.4f}',
+        ])
 
-    data = io.BytesIO(sio.getvalue().encode("utf-8-sig"))  # BOM để Excel mở OK
+    csv_text = sio.getvalue()
+    data = io.BytesIO(csv_text.encode("utf-8-sig"))
+
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    n = len(rows)
-    filename = f"imu_{ts}_{n}rows.csv"
+
+    # sanitize mã bệnh nhân để đưa vào tên file
+    safe_code = "".join(ch for ch in patient_code if ch.isalnum() or ch in ("-", "_"))
+    if safe_code:
+        filename = f"{safe_code}_{ts}_{len(rows)}rows.csv"
+    else:
+        filename = f"imu_{ts}_{len(rows)}rows.csv"
+
+    #  Lưu file vật lý vào thư mục exports/
+    try:
+        os.makedirs(EXPORT_DIR, exist_ok=True)
+        disk_path = os.path.join(EXPORT_DIR, filename)
+        with open(disk_path, "w", encoding="utf-8-sig", newline="") as f:
+            f.write(csv_text)
+
+        #  Nếu có patient_code thì lưu link file vào JSON bệnh nhân
+        if patient_code:
+            _ensure_patients_file()
+            with open(PATIENTS_FILE, "r", encoding="utf-8") as f:
+                pdata = json.load(f) or {}
+
+            rec = pdata.get(patient_code)
+            if rec is not None:
+                ex = rec.get("Exercise") or {}
+                key = ts  # mỗi lần export 1 key mới theo timestamp
+                ex[key] = {
+                    "csv_file": disk_path,
+                    "export_time": ts,
+                    "n_samples": len(rows),
+                }
+                rec["Exercise"] = ex
+                pdata[patient_code] = rec
+
+                with open(PATIENTS_FILE, "w", encoding="utf-8") as f:
+                    json.dump(pdata, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("Không lưu được CSV vật lý hoặc cập nhật JSON:", e)
+        # vẫn trả file CSV xuống cho user, chỉ là không lưu được metadata
+
     data.seek(0)
     return send_file(
         data,
@@ -514,6 +569,7 @@ def session_export_csv():
         download_name=filename,
         max_age=0,
     )
+
 
 
 @app.post("/session/stop")
@@ -665,6 +721,9 @@ def calibration():
 def charts():
     global LAST_SESSION
 
+    patient_code   = request.args.get("patient_code", "").strip()
+    exercise_name  = request.args.get("exercise", "").strip()  # 🔹 tên bài tập hiện tại
+
     # Khi chưa có phiên đo
     if not LAST_SESSION:
         return render_template_string(
@@ -673,19 +732,22 @@ def charts():
             t_ms=[],
             hip=[],
             knee=[],
-            ankle=[]
+            ankle=[],
+            patient_code=patient_code,
+            exercise_name=exercise_name,
         )
 
     rows = LAST_SESSION[:]
-    rows.sort(key=lambda x: x["t_ms"])  # 🔥 Quan trọng nhất
+    rows.sort(key=lambda x: x["t_ms"])
 
-    raw_t = [r["t_ms"] for r in rows]
-    hipArr = [r["hip"] for r in rows]
-    kneeArr = [r["knee"] for r in rows]
+    raw_t    = [r["t_ms"] for r in rows]
+    hipArr   = [r["hip"]   for r in rows]
+    kneeArr  = [r["knee"]  for r in rows]
     ankleArr = [r["ankle"] for r in rows]
 
-    t0 = raw_t[0]
-    t_ms = [round(t - t0, 2) / 10000 for t in raw_t]
+    t0   = raw_t[0]
+    # t_ms tính theo giây từ lúc bắt đầu phiên đo
+    t_ms = [round((t - t0) / 1000.0, 3) for t in raw_t]
 
     return render_template_string(
         CHARTS_HTML,
@@ -693,38 +755,10 @@ def charts():
         t_ms=t_ms,
         hip=hipArr,
         knee=kneeArr,
-        ankle=ankleArr
+        ankle=ankleArr,
+        patient_code=patient_code,
+        exercise_name=exercise_name,
     )
-@app.route("/charts_emg")
-@login_required
-def charts_emg():
-    global LAST_SESSION
-
-    if not LAST_SESSION:
-        return render_template_string(
-            EMG_CHART_HTML,
-            username=current_user.id,
-            t_ms=[],
-            emg=[]
-        )
-
-    rows = LAST_SESSION[:]
-    rows.sort(key=lambda x: x["t_ms"])
-
-    raw_t = [r["t_ms"] for r in rows]
-    t0    = raw_t[0]
-    t_ms  = [round(t - t0, 2) / 10000 for t in raw_t]
-
-    # Sau này bạn chỉ cần lưu thêm key "emg" vào LAST_SESSION là tự hiện
-    emgArr = [r.get("emg", 0.0) for r in rows]
-
-    return render_template_string(
-        EMG_CHART_HTML,
-        username=current_user.id,
-        t_ms=t_ms,
-        emg=emgArr
-    )
-
 
 @app.route("/settings")
 @login_required
@@ -1153,6 +1187,165 @@ body::after{
 
 </body></html>
 """
+CALIBRATION_HTML = """
+<!doctype html><html lang="vi"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hiệu chuẩn</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+<style>
+:root{ --blue:#1669c9; --sbw:260px; }
+
+/* Nền + font giống các trang khác */
+body{
+  background:#e8f3ff;
+  margin:0;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+/* Bố cục & sidebar giống Patients/Charts */
+.layout{
+  display:flex;
+  gap:16px;
+  position:relative;
+}
+.sidebar{
+  background:var(--blue); color:#fff;
+  border-top-right-radius:16px;
+  border-bottom-right-radius:16px;
+  padding:16px;
+  width:var(--sbw);
+  min-height:100vh;
+  box-sizing:border-box;
+}
+.sidebar-col{
+  flex:0 0 var(--sbw);
+  max-width:var(--sbw);
+  transition:flex-basis .28s ease, max-width .28s ease, transform .28s ease;
+  will-change:flex-basis,max-width,transform;
+}
+.main-col{
+  flex:1 1 auto;
+  min-width:0;
+}
+
+/* Sidebar thu gọn khi bấm 3 gạch */
+.sb-collapsed .sidebar-col{
+  flex-basis:0;
+  max-width:0;
+  transform:translateX(-8px);
+}
+.sb-collapsed .sidebar{
+  padding:0;
+  width:0;
+  border-radius:0;
+}
+.sb-collapsed .sidebar *{
+  display:none;
+}
+
+/* Nút 3 gạch trên navbar */
+#btnToggleSB{
+  border:2px solid #d8e6ff;
+  border-radius:10px;
+  background:#fff;
+  padding:6px 10px;
+  font-weight:700;
+}
+#btnToggleSB:hover{ background:#f4f8ff; }
+
+/* Nút menu bên trái */
+.menu-btn{
+  width:100%;
+  display:block;
+  background:#1973d4;
+  border:none;
+  color:#fff;
+  padding:10px 12px;
+  margin:8px 0;
+  border-radius:12px;
+  font-weight:600;
+  text-align:left;
+  text-decoration:none;
+}
+.menu-btn:hover{ background:#1f80ea; color:#fff; }
+.menu-btn.active{ background:#0f5bb0; }
+
+/* Khung video chính giữa */
+.video-card{
+  background:#ffffff;
+  border-radius:18px;
+  box-shadow:0 10px 30px rgba(15,23,42,.16);
+  padding:18px 18px 22px;
+  max-width:1100px;
+  margin:24px auto 32px auto;  /* căn giữa */
+}
+.video-title{
+  font-weight:700;
+  color:#0a3768;
+  margin-bottom:12px;
+}
+.video-frame{
+  border-radius:16px;
+  overflow:hidden;
+  background:#000;
+}
+.video-frame video{
+  width:100%;
+  height:100%;
+  display:block;
+}
+</style>
+</head>
+<body class="sb-collapsed">
+
+<nav class="navbar bg-white shadow-sm px-3">
+  <div class="container-fluid d-flex align-items-center">
+    <button id="btnToggleSB" class="btn me-2">☰</button>
+    <span class="navbar-brand mb-0">Xin chào, {{username}}</span>
+    <div class="ms-auto d-flex align-items-center gap-2">
+      <a class="btn btn-outline-secondary" href="/logout">Đăng xuất</a>
+      <img src="{{ url_for('static', filename='unnamed.png') }}" alt="Logo" height="40">
+    </div>
+  </div>
+</nav>
+
+<div class="container-fluid my-3">
+  <div class="layout">
+    <!-- Sidebar -->
+    <aside class="sidebar-col">
+      <div class="sidebar">
+        <div class="mb-2 fw-bold">MENU</div>
+        <a class="menu-btn" href="/">Trang chủ</a>
+        <a class="menu-btn active" href="/calibration">Hiệu chuẩn</a>
+        <a class="menu-btn" href="/patients/manage">Thông tin bệnh nhân</a>
+        <a class="menu-btn" href="/patients">Xem lại</a>
+        <a class="menu-btn" href="/charts">Biểu đồ</a>
+        <a class="menu-btn" href="/settings">Cài đặt</a>
+      </div>
+    </aside>
+
+    <!-- Main -->
+    <main class="main-col">
+      <div class="video-card">
+        <div class="video-title">HƯỚNG DẪN HIỆU CHUẨN IMU</div>
+        <div class="video-frame ratio ratio-16x9">
+          <video autoplay loop muted controls playsinline>
+            <source src="{{ url_for('static', filename='videos/calibration_loop.mp4') }}" type="video/mp4">
+            Trình duyệt của bạn không hỗ trợ video.
+          </video>
+        </div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<script>
+document.getElementById('btnToggleSB').addEventListener('click', () => {
+  document.body.classList.toggle('sb-collapsed');
+});
+</script>
+</body></html>
+"""
 
 
 # ======= Patients List (Xem lại) – sidebar thu gọn kiểu hiệu chuẩn =======
@@ -1389,7 +1582,7 @@ body{
 
 
 # ======= Dashboard (sidebar ẩn, bấm ☰ để mở) =======
-DASH_HTML = """
+DASH_HTML = """ 
 <!doctype html><html lang="vi"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>IMU Dashboard</title>
@@ -1521,18 +1714,28 @@ body{ background:#fafbfe }
              <div class="col-6">
                <label class="form-label">Chiều cao :</label>
                <input id="pat_height" class="form-control">
-              </div>
-              <div class="col-8"><label class="form-label">Bài kiểm tra :</label>
-                <div class="input-group">
-                  <select class="form-select" id="exerciseSelect">
-                    <option>ankle flexion</option>
-                    <option>knee flexion</option>
-                    <option>hip flexion</option>
-                  </select>
-                  <button class="btn btn-outline-thick">Thêm bài tập</button>
-                </div>
-              </div>
-              <div class="col-4"><label class="form-label">Ngày đo :</label><input type="date" class="form-control"></div>
+             </div>
+
+             <input type="hidden" id="pat_code">
+
+             <!-- BÀI KIỂM TRA + NGÀY ĐO -->
+             <div class="col-8">
+               <label class="form-label">Bài kiểm tra :</label>
+               <div class="input-group">
+                 <select class="form-select" id="exerciseSelect">
+                   <option value="ankle flexion">ankle flexion</option>
+                   <option value="knee flexion">knee flexion</option>
+                   <option value="hip flexion">hip flexion</option>
+                 </select>
+                 <button class="btn btn-outline-thick" type="button" id="btnAddExercise">+</button>
+               </div>
+             </div>
+
+             <div class="col-4">
+               <label class="form-label">Ngày đo :</label>
+               <input id="measure_date" type="date" class="form-control">
+             </div>
+
             </div>
           </div>
 
@@ -1550,7 +1753,7 @@ body{ background:#fafbfe }
             </div>
 
             <div id="threeMount"
-                 style="width:100%; height:480px; min-height:480px; border-radius:14px; overflow:visible; position:relative; position:relative; z-index:1;">
+                 style="width:100%; height:480px; min-height:480px; border-radius:14px; overflow:visible; position:relative; z-index:1;">
             </div>
 
             <div class="text-center mt-2">
@@ -1570,13 +1773,43 @@ body{ background:#fafbfe }
           </div>
         </div>
 
-        <!-- NÚT -->
+        <!-- NÚT + KẾT QUẢ -->
         <div class="col-lg-5">
           <div class="panel d-grid gap-3">
             <button class="btn btn-outline-thick py-3" id="btnStart">Bắt đầu đo</button>
             <button class="btn btn-outline-thick py-3" id="btnStop">Kết thúc đo</button>
             <button class="btn btn-outline-thick py-3" id="btnSave">Lưu kết quả</button>
-          </div>
+
+            <!-- Kết quả bài hiện tại (hiện tại không dùng nữa, để sẵn nếu sau này cần) -->
+            <div id="exercise-result-panel" class="mt-3" style="display:none;">
+              <h6 id="exercise-title-text" class="fw-bold mb-2"></h6>
+              <div style="height:160px;">
+                <canvas id="exercise-chart"></canvas>
+              </div>
+              <div class="mt-2 small">
+                <div>ROM Hip: <span id="rom-hip-text">0°</span></div>
+                <div>ROM Knee: <span id="rom-knee-text">0°</span></div>
+                <div>ROM Ankle: <span id="rom-ankle-text">0°</span></div>
+                <div class="mt-1 fw-bold">
+                  Điểm bài này: <span id="score-text">0</span> / 2
+                </div>
+              </div>
+              <div class="mt-3 d-flex gap-2">
+                <button id="btn-next-ex" class="btn btn-outline-thick flex-grow-1">
+                  Bài tập tiếp theo
+                </button>
+              </div>
+            </div>
+
+            <!-- Tổng kết tất cả bài (hiện tại không dùng nữa, sẽ tổng hợp ở tab Biểu đồ) -->
+            <div id="all-exercise-summary" class="mt-3" style="display:none;">
+              <h6 class="fw-bold">Tổng kết tất cả bài tập</h6>
+              <ul class="small mb-2" id="summary-list"></ul>
+              <div class="fw-bold">
+                Tổng điểm: <span id="total-score-text">0</span>
+              </div>
+            </div>
+          </div> 
         </div>
 
         <!-- HƯỚNG DẪN -->
@@ -1634,21 +1867,79 @@ body{ background:#fafbfe }
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 
 <script>
-// ===== Video hướng dẫn =====
+// ===== Video hướng dẫn & sidebar =====
 const videosMap = {{ videos|tojson }};
+const videoKeys = Object.keys(videosMap || {});
 const sel = document.getElementById('exerciseSelect');
 const vid = document.getElementById('guideVideo');
-function updateVideo() {
-  const key = sel.value;
-  let url = videosMap[key];
-  if (!url) { vid.removeAttribute('src'); vid.load(); return; }
 
-  if (vid.getAttribute('src') !== url) { vid.setAttribute('src', url); vid.load(); }
-  vid.play().catch(()=>{});
+// đưa ra global để script sau dùng
+window.videosMap = videosMap;
+window.EXERCISE_KEYS = videoKeys;
+window.currentExerciseIndex = 0;
+const btnAddExercise = document.getElementById('btnAddExercise');
+if (btnAddExercise && sel) {
+  btnAddExercise.addEventListener('click', () => {
+    const name = prompt('Nhập tên bài tập mới:');
+    if (!name) return;
+    const key = name.trim();
+    if (!key) return;
+    const exists = (window.EXERCISE_KEYS || []).some(
+      k => k.toLowerCase() === key.toLowerCase()
+    );
+    if (exists) {
+      alert('Bài tập này đã có trong danh sách.');
+      return;
+    }
+    const opt = document.createElement('option');
+    opt.value = key;
+    opt.textContent = key;
+    sel.appendChild(opt);
+    window.EXERCISE_KEYS.push(key);
+    window.videosMap[key] = null; 
+    sel.value = key;
+    window.currentExerciseIndex = window.EXERCISE_KEYS.length - 1;
+    if (typeof window.updateVideo === 'function') {
+      window.updateVideo(key);
+    }
+  });
 }
-sel.addEventListener('change', updateVideo);
-updateVideo();
 
+window.updateVideo = function(forceKey){
+  if (!vid) return;
+  let key = forceKey;
+
+  if (!key){
+    if (sel && sel.value) key = sel.value;
+    else if (videoKeys.length) key = videoKeys[window.currentExerciseIndex] || videoKeys[0];
+  }
+
+  if (!key || !videosMap[key]){
+    vid.removeAttribute('src'); vid.load();
+    return;
+  }
+
+  const idx = videoKeys.indexOf(key);
+  window.currentExerciseIndex = idx >= 0 ? idx : 0;
+
+  if (sel && sel.value !== key) sel.value = key;
+
+  const url = videosMap[key];
+  if (vid.getAttribute('src') !== url){
+    vid.setAttribute('src', url);
+    vid.load();
+  }
+  vid.play().catch(()=>{});
+};
+
+if (sel){
+  sel.addEventListener('change', () => window.updateVideo(sel.value));
+}
+
+// gọi lần đầu
+window.updateVideo();
+
+// Toggle sidebar
 document.getElementById('btnToggleSB').addEventListener('click', ()=>{
   document.body.classList.toggle('sb-collapsed');
 });
@@ -1663,6 +1954,9 @@ function fillPatientOnDashboard(rec){
   document.getElementById('pat_gender').value = rec.Gender || "";
   document.getElementById('pat_weight').value = rec.Weight || "";
   document.getElementById('pat_height').value = rec.Height || "";
+  const code = rec.PatientCode || rec.Patientcode || "";
+  const codeInput = document.getElementById('pat_code');
+  if (codeInput) codeInput.value = code;
 }
 
 function renderPatRows(rows){
@@ -1720,6 +2014,9 @@ document.getElementById('pm_search').addEventListener('input', (e)=>{
 </script>
 
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<!-- Chart.js để vẽ biểu đồ từng bài (nếu sau này dùng panel kết quả tại chỗ) -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
 <script type="module">
   import * as THREE from 'https://unpkg.com/three@0.154.0/build/three.module.js';
   window.THREE = THREE;
@@ -1729,7 +2026,7 @@ document.getElementById('pm_search').addEventListener('input', (e)=>{
   const mount = document.getElementById('threeMount');
   const statusEl = document.getElementById('status3D');
 
-  // Scene (nền xanh nhạt; muốn trắng: đổi 0xeaf2ff -> 0xffffff)
+  // Scene
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0xeaf2ff);
 
@@ -1787,7 +2084,7 @@ document.getElementById('pm_search').addEventListener('input', (e)=>{
 
   // Load GLB
   const loader = new GLTFLoader();
-  const GLB_URL = "{{ url_for('static', filename='models/leg_model.glb') }}";
+  const GLB_URL = "{{ url_for('static', filename='leg_model.glb') }}";
 
   loader.load(
     GLB_URL,
@@ -1825,7 +2122,7 @@ document.getElementById('pm_search').addEventListener('input', (e)=>{
       const box0 = new THREE.Box3().setFromObject(model);
       const size0 = new THREE.Vector3(); box0.getSize(size0);
       const center0 = new THREE.Vector3(); box0.getCenter(center0);
-      model.position.sub(center0);  // tâm về gốc
+      model.position.sub(center0);
       model.updateMatrixWorld(true);
 
       const maxDim = Math.max(size0.x, size0.y, size0.z) || 1;
@@ -1835,12 +2132,12 @@ document.getElementById('pm_search').addEventListener('input', (e)=>{
       model.updateMatrixWorld(true);
 
       const box1 = new THREE.Box3().setFromObject(model);
-      model.position.y += -box1.min.y;  // đặt chạm sàn
+      model.position.y += -box1.min.y;
       model.updateMatrixWorld(true);
 
       const box2 = new THREE.Box3().setFromObject(model);
       const c2 = box2.getCenter(new THREE.Vector3());
-      model.position.x -= c2.x;  // căn giữa X,Z
+      model.position.x -= c2.x;
       model.position.z -= c2.z;
       model.updateMatrixWorld(true);
 
@@ -1866,7 +2163,6 @@ document.getElementById('pm_search').addEventListener('input', (e)=>{
         }
       }
 
-      // Sửa 3 tên dưới cho khớp với file của bạn nếu khác (vd mixamorig:LeftUpLeg/LeftLeg/LeftFoot)
       const NAME_MAP = {
         hip:   'thighL',
         knee:  'shinL',
@@ -1878,7 +2174,6 @@ document.getElementById('pm_search').addEventListener('input', (e)=>{
         return BONE_REG.get(key) || [];
       }
 
-      // Trục/chiều/offset (+ helper để bạn hiệu chỉnh trong Console)
       const AXISVEC = { x:new THREE.Vector3(1,0,0), y:new THREE.Vector3(0,1,0), z:new THREE.Vector3(0,0,1) };
       const AXIS =  { hip:'x', knee:'x', ankle:'x' };
       const SIGN =  { hip: -1,  knee: 1,  ankle: 1  };
@@ -1918,7 +2213,6 @@ document.getElementById('pm_search').addEventListener('input', (e)=>{
           for (const b of arr) if (b.userData.bindQ) b.quaternion.copy(b.userData.bindQ);
       });
 
-      // Clipping
       const bbox = new THREE.Box3().setFromObject(model);
       const size = bbox.getSize(new THREE.Vector3());
       const rad  = size.length() * 0.5 || 1;
@@ -1938,7 +2232,6 @@ document.getElementById('pm_search').addEventListener('input', (e)=>{
     }
   );
 
-  // Render loop
   function animate() {
     requestAnimationFrame(animate);
     controls.update();
@@ -1946,7 +2239,6 @@ document.getElementById('pm_search').addEventListener('input', (e)=>{
   }
   animate();
 
-  // API nhận góc từ ngoài
   window.pushAngles = (hip, knee, ankle) => {
     if (window.legReady && typeof window.applyLegAngles === "function") {
       window.applyLegAngles(hip, knee, ankle);
@@ -1958,11 +2250,139 @@ document.getElementById('pm_search').addEventListener('input', (e)=>{
 
 <!-- Socket & Start/Stop -->
 <script id="imu-handlers">
-  const btnSave = document.getElementById("btnSave");
-  if (btnSave) btnSave.addEventListener("click", () => {
-    window.open("/session/export_csv", "_blank");
+  const btnSave   = document.getElementById("btnSave");
+  const btnStart  = document.getElementById("btnStart");
+  const btnStop   = document.getElementById("btnStop");
+  const exerciseSelect = document.getElementById("exerciseSelect");
+  const resultPanel  = document.getElementById("exercise-result-panel");
+  const summaryPanel = document.getElementById("all-exercise-summary");
+  const btnNextEx    = document.getElementById("btn-next-ex");
+
+  if (btnStop) btnStop.disabled = true;
+   // ===== GIẢ LẬP NHỊP TIM – chỉ chạy khi đang đo =====
+  let heartSimTimer = null;
+  let heartVal = 75;
+  let heartDir = 1;
+
+  function startHeartSim(){
+    const el = document.getElementById("heartRate");
+    if (!el) return;
+    if (heartSimTimer) return;   // đang chạy rồi
+
+    const MIN = 70;
+    const MAX = 95;
+
+    function step(){
+      // nếu đã dừng đo thì dừng luôn giả lập
+      if (!isMeasuring){
+        heartSimTimer = null;
+        return;
+      }
+
+      heartVal += heartDir * (Math.random() * 1.5 + 0.5);
+
+      if (heartVal >= MAX){ heartVal = MAX; heartDir = -1; }
+      if (heartVal <= MIN){ heartVal = MIN; heartDir = 1; }
+
+      el.value = heartVal.toFixed(0);
+
+      heartSimTimer = setTimeout(step, Math.random()*400 + 300);
+    }
+
+    // reset giá trị mỗi lần bắt đầu
+    heartVal = 75;
+    heartDir = 1;
+    step();
+  }
+
+  function stopHeartSim(){
+    if (heartSimTimer){
+      clearTimeout(heartSimTimer);
+      heartSimTimer = null;
+    }
+  }
+
+  // ====== HÀM CHẤM ĐIỂM FMA (0–2) theo ROM Knee ======
+  function fmaScore(rom){
+    rom = Number(rom) || 0;
+    if (rom >= 90) return 2;
+    if (rom >= 40 && rom <= 50) return 1;
+    if (rom < 10) return 0;
+    return 1;
+  }
+
+  // ====== STATE ĐO TỪNG BÀI ======
+  const EXERCISE_ORDER = (window.EXERCISE_KEYS && window.EXERCISE_KEYS.length)
+    ? window.EXERCISE_KEYS
+    : ["ankle flexion","knee flexion","hip flexion"];
+
+  let isMeasuring = false;
+  let currentSamples = [];   // {hip,knee,ankle}
+  let exerciseResults = {};  // name -> {romHip,romKnee,romAnkle,score,samples}
+  let exerciseChart = null;
+
+  function getCurrentExerciseName(){
+    return exerciseSelect ? (exerciseSelect.value || "exercise") : "exercise";
+  }
+
+  function getExerciseIndex(name){
+    const idx = EXERCISE_ORDER.indexOf(name);
+    return idx >= 0 ? idx : 0;
+  }
+
+  // (Các hàm showExerciseResult, showAllSummary, btnNextEx hiện không dùng – để lại cho tương lai)
+
+  // ========== NÚT LƯU THÔNG TIN BỆNH NHÂN ==========
+  if (btnSave) btnSave.addEventListener("click", async () => {
+    const name   = document.getElementById('pat_name').value.trim();
+    const cccd   = document.getElementById('pat_cccd').value.trim();
+    const dob    = document.getElementById('pat_dob').value.trim();
+    const gender = document.getElementById('pat_gender').value.trim();
+    const weight = document.getElementById('pat_weight').value.trim();
+    const height = document.getElementById('pat_height').value.trim();
+    const codeEl = document.getElementById('pat_code');
+    const patient_code = codeEl ? (codeEl.value || "").trim() : "";
+
+    if (!name){
+      alert("Vui lòng nhập HỌ VÀ TÊN bệnh nhân trước khi lưu.");
+      return;
+    }
+
+    const payload = {
+      patient_code: patient_code,
+      name:         name,
+      national_id:  cccd,
+      dob:          dob,
+      gender:       gender,
+      weight:       weight,
+      height:       height
+    };
+
+    try {
+      const res = await fetch("/api/patients", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const j = await res.json();
+
+      if (!j.ok) {
+        alert(j.msg || "Lưu thông tin bệnh nhân thất bại.");
+        return;
+      }
+
+      if (codeEl && j.patient_code) {
+        codeEl.value = j.patient_code;
+      }
+
+      alert("Đã lưu thông tin bệnh nhân: " + (j.patient_code || patient_code || "(mới)"));
+    } catch (e) {
+      console.error(e);
+      alert("Có lỗi khi gửi dữ liệu lên server.");
+    }
   });
 
+  // ========== SOCKET IO – cập nhật góc & thu mẫu ==========
   window.socket = window.socket || io({
     transports: ['websocket'],
     upgrade: false,
@@ -1971,11 +2391,13 @@ document.getElementById('pm_search').addEventListener('input', (e)=>{
     reconnectionDelay: 500
   });
   const socket = window.socket;
+
   socket.on('connect', () => console.log('[SOCKET] connected:', socket.id));
   socket.on('connect_error', (err) => console.error('[SOCKET] connect_error:', err));
   socket.on('disconnect', (r) => console.warn('[SOCKET] disconnected:', r));
 
   socket.on("imu_data", (msg) => {
+    // Bảng số trực tiếp
     const tr = document.querySelector("#tblAngles tr");
     if (tr) {
       const tds = tr.querySelectorAll("td");
@@ -1985,10 +2407,21 @@ document.getElementById('pm_search').addEventListener('input', (e)=>{
         if (msg.ankle != null) tds[2].textContent = Number(msg.ankle).toFixed(2);
       }
     }
+
+    // Badge nhỏ dưới 3D
     if (msg.hip   != null) document.getElementById('liveHip').textContent   = Number(msg.hip).toFixed(1);
     if (msg.knee  != null) document.getElementById('liveKnee').textContent  = Number(msg.knee).toFixed(1);
     if (msg.ankle != null) document.getElementById('liveAnkle').textContent = Number(msg.ankle).toFixed(1);
 
+    // Nếu đang đo thì lưu mẫu để vẽ biểu đồ & tính ROM
+    if (isMeasuring){
+      const hip   = Number(msg.hip   ?? 0);
+      const knee  = Number(msg.knee  ?? 0);
+      const ankle = Number(msg.ankle ?? 0);
+      currentSamples.push({hip,knee,ankle});
+    }
+
+    // 3D
     const hip   = msg.hip   ?? 0;
     const knee  = msg.knee  ?? 0;
     const ankle = msg.ankle ?? 0;
@@ -1999,190 +2432,138 @@ document.getElementById('pm_search').addEventListener('input', (e)=>{
     }
   });
 
-  const btnStart = document.getElementById("btnStart");
-  const btnStop  = document.getElementById("btnStop");
+  // ========== NÚT BẮT ĐẦU / KẾT THÚC ĐO ==========
   if (btnStart) btnStart.addEventListener("click", async () => {
+    if (isMeasuring) return;
+    try {
+      const curName   = getCurrentExerciseName();
+      const firstName = EXERCISE_ORDER[0];
+      if (curName === firstName) {
+        localStorage.removeItem("exerciseScores");
+      }
+    } catch(e){}
     const r = await fetch("/session/start", { method: "POST" });
     const j = await r.json();
     console.log("[START RESPONSE]", j);
-    if (!j.ok) alert(j.msg || "Không start được phiên đo");
+    if (!j.ok) {
+      alert(j.msg || "Không start được phiên đo");
+      return;
+    }
+
+    isMeasuring = true;
+    currentSamples = [];
+    startHeartSim();
+
+    btnStart.disabled  = true;
+    btnStart.textContent = "Đang đo...";
+    btnStop.disabled   = false;
+    btnStop.textContent  = "Kết thúc đo";
+    resultPanel.style.display  = "none";
+    summaryPanel.style.display = "none";
   });
+
   if (btnStop) btnStop.addEventListener("click", async () => {
-    const r = await fetch("/session/stop", { method: "POST" });
-    const j = await r.json();
-    if (!j.ok) alert(j.msg || "Không stop được phiên đo");
-    if (j.ok) window.location.href = "/charts";
+     const r = await fetch("/session/stop", { method: "POST" });
+     let j = {};
+     try { j = await r.json(); } catch(e){}
+
+     isMeasuring = false;
+     stopHeartSim();
+     btnStart.disabled = false;
+     btnStop.disabled  = true;
+     btnStart.textContent = "Bắt đầu đo";
+
+     // Tính ROM & Score từ currentSamples
+     let romHip = 0, romKnee = 0, romAnkle = 0, score = 0;
+     let maxKnee = 0, minKnee = 0;
+
+     if (currentSamples.length){
+        const hips   = currentSamples.map(s => s.hip);
+        const knees  = currentSamples.map(s => s.knee);
+        const ankles = currentSamples.map(s => s.ankle);
+
+        const maxHip   = Math.max(...hips);
+        const minHip   = Math.min(...hips);
+        maxKnee        = Math.max(...knees);
+        minKnee        = Math.min(...knees);
+        const maxAnkle = Math.max(...ankles);
+        const minAnkle = Math.min(...ankles);
+
+        romHip   = maxHip   - minHip;
+        romKnee  = maxKnee  - minKnee;
+        romAnkle = maxAnkle - minAnkle;
+        score    = fmaScore(romKnee);
+     }
+
+     const exName = getCurrentExerciseName();
+     const result = {
+        name: exName,
+        romHip, romKnee, romAnkle,
+        score,
+        maxKnee,
+        minKnee
+     };
+
+     // Lưu vào localStorage (để tab Biểu đồ đọc lại)
+     let store = {};
+     try { store = JSON.parse(localStorage.getItem("exerciseScores") || "{}"); }
+     catch(e){ store = {}; }
+     store[exName] = result;
+     localStorage.setItem("exerciseScores", JSON.stringify(store));
+
+     // Lấy patient code
+     const pat = (document.getElementById("pat_code")?.value || "").trim();
+
+     // Redirect sang trang CHARTS_HTML để xem biểu đồ & đánh giá
+     let url = "/charts?exercise=" + encodeURIComponent(exName);
+     if (pat) url += "&patient_code=" + encodeURIComponent(pat);
+
+     window.location.href = url;
   });
+
+  // Tự động chọn bài tập khi quay lại từ /charts?next_ex=...
+  const urlParams = new URLSearchParams(window.location.search);
+
+  if (urlParams.has("next_ex")) {
+      const nextEx = urlParams.get("next_ex").trim();
+
+      const sel = document.getElementById("exerciseSelect");
+      if (sel) {
+          const options = [...sel.options].map(o => o.value.toLowerCase());
+          const foundIndex = options.indexOf(nextEx.toLowerCase());
+
+          if (foundIndex >= 0) {
+              sel.value = sel.options[foundIndex].value;
+          } else {
+              const opt = document.createElement("option");
+              opt.value = nextEx;
+              opt.textContent = nextEx;
+              sel.appendChild(opt);
+              sel.value = nextEx;
+          }
+      }
+
+      if (typeof window.updateVideo === "function") {
+          window.updateVideo(nextEx);
+      }
+
+      if (window.EXERCISE_KEYS) {
+          const idx = window.EXERCISE_KEYS.indexOf(nextEx);
+          if (idx >= 0) window.currentExerciseIndex = idx;
+      }
+  }
+</script> 
 </script>
 
 </body></html>
 """
 
 
-# ======= NEW: Calibration page =======
-CALIBRATION_HTML = """
-<!doctype html><html lang="vi"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Hiệu chuẩn</title>
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-<style>
-:root{ --blue:#1669c9; --sbw:260px; }
 
-/* Nền + font giống các trang khác */
-body{
-  background:#e8f3ff;
-  margin:0;
-  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-}
-
-/* Bố cục & sidebar giống Patients/Charts */
-.layout{
-  display:flex;
-  gap:16px;
-  position:relative;
-}
-.sidebar{
-  background:var(--blue); color:#fff;
-  border-top-right-radius:16px;
-  border-bottom-right-radius:16px;
-  padding:16px;
-  width:var(--sbw);
-  min-height:100vh;
-  box-sizing:border-box;
-}
-.sidebar-col{
-  flex:0 0 var(--sbw);
-  max-width:var(--sbw);
-  transition:flex-basis .28s ease, max-width .28s ease, transform .28s ease;
-  will-change:flex-basis,max-width,transform;
-}
-.main-col{
-  flex:1 1 auto;
-  min-width:0;
-}
-
-/* Sidebar thu gọn khi bấm 3 gạch */
-.sb-collapsed .sidebar-col{
-  flex-basis:0;
-  max-width:0;
-  transform:translateX(-8px);
-}
-.sb-collapsed .sidebar{
-  padding:0;
-  width:0;
-  border-radius:0;
-}
-.sb-collapsed .sidebar *{
-  display:none;
-}
-
-/* Nút 3 gạch trên navbar */
-#btnToggleSB{
-  border:2px solid #d8e6ff;
-  border-radius:10px;
-  background:#fff;
-  padding:6px 10px;
-  font-weight:700;
-}
-#btnToggleSB:hover{ background:#f4f8ff; }
-
-/* Nút menu bên trái */
-.menu-btn{
-  width:100%;
-  display:block;
-  background:#1973d4;
-  border:none;
-  color:#fff;
-  padding:10px 12px;
-  margin:8px 0;
-  border-radius:12px;
-  font-weight:600;
-  text-align:left;
-  text-decoration:none;
-}
-.menu-btn:hover{ background:#1f80ea; color:#fff; }
-.menu-btn.active{ background:#0f5bb0; }
-
-/* Khung video chính giữa */
-.video-card{
-  background:#ffffff;
-  border-radius:18px;
-  box-shadow:0 10px 30px rgba(15,23,42,.16);
-  padding:18px 18px 22px;
-  max-width:1100px;
-  margin:24px auto 32px auto;  /* căn giữa */
-}
-.video-title{
-  font-weight:700;
-  color:#0a3768;
-  margin-bottom:12px;
-}
-.video-frame{
-  border-radius:16px;
-  overflow:hidden;
-  background:#000;
-}
-.video-frame video{
-  width:100%;
-  height:100%;
-  display:block;
-}
-</style>
-</head>
-<body class="sb-collapsed">
-
-<nav class="navbar bg-white shadow-sm px-3">
-  <div class="container-fluid d-flex align-items-center">
-    <button id="btnToggleSB" class="btn me-2">☰</button>
-    <span class="navbar-brand mb-0">Xin chào, {{username}}</span>
-    <div class="ms-auto d-flex align-items-center gap-2">
-      <a class="btn btn-outline-secondary" href="/logout">Đăng xuất</a>
-      <img src="{{ url_for('static', filename='unnamed.png') }}" alt="Logo" height="40">
-    </div>
-  </div>
-</nav>
-
-<div class="container-fluid my-3">
-  <div class="layout">
-    <!-- Sidebar -->
-    <aside class="sidebar-col">
-      <div class="sidebar">
-        <div class="mb-2 fw-bold">MENU</div>
-        <a class="menu-btn" href="/">Trang chủ</a>
-        <a class="menu-btn active" href="/calibration">Hiệu chuẩn</a>
-        <a class="menu-btn" href="/patients/manage">Thông tin bệnh nhân</a>
-        <a class="menu-btn" href="/patients">Xem lại</a>
-        <a class="menu-btn" href="/charts">Biểu đồ</a>
-        <a class="menu-btn" href="/settings">Cài đặt</a>
-      </div>
-    </aside>
-
-    <!-- Main -->
-    <main class="main-col">
-      <div class="video-card">
-        <div class="video-title">HƯỚNG DẪN HIỆU CHUẨN IMU</div>
-        <div class="video-frame ratio ratio-16x9">
-          <video autoplay loop muted controls playsinline>
-            <source src="{{ url_for('static', filename='videos/calibration_loop.mp4') }}" type="video/mp4">
-            Trình duyệt của bạn không hỗ trợ video.
-          </video>
-        </div>
-      </div>
-    </main>
-  </div>
-</div>
-
-<script>
-document.getElementById('btnToggleSB').addEventListener('click', () => {
-  document.body.classList.toggle('sb-collapsed');
-});
-</script>
-</body></html>
-"""
-
-
-CHARTS_HTML = """<!doctype html> 
-<html lang="vi"><head>
+CHARTS_HTML = """
+<!doctype html>
+<html lang="vi">
+<head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Biểu đồ góc khớp</title>
@@ -2196,9 +2577,9 @@ CHARTS_HTML = """<!doctype html>
 body{
   background:#e8f3ff;
   margin:0;
+  font-size:15px;
 }
 
-/* ===== Sidebar layout giống trang chủ ===== */
 .layout{ display:flex; gap:16px; position:relative; }
 
 .sidebar-col{
@@ -2215,7 +2596,6 @@ body{
 }
 .main-col{ flex:1 1 auto; min-width:0; }
 
-/* Thu gọn */
 body.sb-collapsed .sidebar-col{
   flex-basis:0 !important;
   max-width:0 !important;
@@ -2227,7 +2607,6 @@ body.sb-collapsed .sidebar *{
   display:none;
 }
 
-/* Nút 3 gạch */
 #btnToggleSB{
   border:2px solid #d8e6ff;
   background:#fff;
@@ -2235,11 +2614,8 @@ body.sb-collapsed .sidebar *{
   padding:6px 10px;
   font-weight:700;
 }
-#btnToggleSB:hover{
-  background:#eef6ff;
-}
+#btnToggleSB:hover{ background:#eef6ff; }
 
-/* Menu nút */
 .menu-btn{
   width:100%;
   display:block;
@@ -2256,7 +2632,6 @@ body.sb-collapsed .sidebar *{
 .menu-btn:hover{ background:#1f80ea; }
 .menu-btn.active{ background:#0f5bb0; }
 
-/* Card panel */
 .panel{
   background:#fff;
   border-radius:16px;
@@ -2267,48 +2642,90 @@ body.sb-collapsed .sidebar *{
 
 .chart-box{ height:260px; }
 
-/* Cột đánh giá */
+/* Khối đánh giá */
 .eval-panel{
   background:#ffffff;
-  border-radius:16px;
-  box-shadow:0 8px 20px rgba(15,23,42,.12);
-  padding:16px;
+  border-radius:18px;
+  box-shadow:0 10px 24px rgba(15,23,42,.16);
+  padding:18px 18px 14px 18px;
 }
-.eval-header{ font-weight:700; color:#0b3769; }
+.eval-header{
+  font-weight:800;
+  color:#0b3769;
+  font-size:1.1rem;
+}
+.eval-subtitle{
+  font-size:.9rem;
+  color:#64748b;
+}
+.eval-item{
+  font-size:.95rem;
+}
 .eval-item + .eval-item{
   border-top:1px dashed #e2e8f0;
   margin-top:10px;
   padding-top:10px;
 }
 
-/* Hộp thang điểm & tổng kết */
-.score-box{
-  margin-top:14px;
-  padding:12px;
-  border-radius:12px;
-  background:#f8faff;
-  border:1px solid #dbe7ff;
-  box-shadow:0 4px 12px rgba(0,0,0,0.05);
+.eval-badge{
+  font-size:.8rem;
+  padding:4px 8px;
+  border-radius:999px;
 }
-.score-total{
-  font-size:1.4rem;
+
+#totalScore{
+  font-size:.95rem;
+  padding:6px 10px;
+  border-radius:999px;
+}
+
+/* nhấn mạnh nhãn đánh giá (Yếu / Trung bình / Tốt) */
+.strength-label{
   font-weight:700;
+  font-size:1rem;
   color:#0b3769;
 }
-.health-status{
-  font-weight:700;
+.strength-desc{
+  font-size:.9rem;
+  color:#6b7280;
+}
+
+/* NOTE BOX cho mô tả đánh giá */
+.strength-desc{
+  font-size:.9rem;
+  color:#0b3769;   /* MÀU XANH ĐẬM CHO RÕ */
+  font-weight:500;
+  background:#e8f5ff;
+
+  border-radius:10px;
+}
+
+
+/* Tổng điểm các bài đã đo – to, ở giữa */
+.total-summary{
+  margin-top:10px;
+  text-align:center;
+  font-weight:800;
+  font-size:1.05rem;
+  color:#0b3769;
+}
+.total-summary span{
+  display:inline-block;
+  margin-left:6px;
+  padding:4px 14px;
+  border-radius:999px;
+  background:#1d4ed8;
+  color:#fff;
   font-size:1rem;
 }
 </style>
 </head>
+
 <body class="sb-collapsed">
 
-<!-- NAVBAR -->
 <nav class="navbar bg-white shadow-sm px-3">
   <div class="container-fluid d-flex align-items-center">
-
     <button id="btnToggleSB" class="btn me-2">☰</button>
-
     <span class="navbar-brand mb-0">Xin chào, {{username}}</span>
 
     <div class="ms-auto d-flex align-items-center gap-3">
@@ -2321,7 +2738,6 @@ body.sb-collapsed .sidebar *{
 <div class="container-fluid my-3">
   <div class="layout">
 
-    <!-- SIDEBAR -->
     <aside class="sidebar-col">
       <div class="sidebar">
         <div class="mb-2 fw-bold">MENU</div>
@@ -2334,21 +2750,40 @@ body.sb-collapsed .sidebar *{
       </div>
     </aside>
 
-    <!-- MAIN CONTENT -->
     <main class="main-col">
       <div class="row g-3">
 
-        <!-- Biểu đồ -->
         <div class="col-lg-9">
           <div class="panel">
             <div class="d-flex justify-content-between align-items-center">
+
               <div>
-                <h5>Biểu đồ góc khớp theo thời gian</h5>
-                <div class="text-muted small">Phiên đo gần nhất, t_ms tính từ lúc bắt đầu phiên đo.</div>
+                <h5 class="mb-1">Biểu đồ góc khớp theo thời gian</h5>
+                <div class="text-muted small">Phiên đo gần nhất.</div>
+
+                {% if exercise_name %}
+                <div class="text-muted small">Bài tập: <strong>{{ exercise_name }}</strong></div>
+                {% endif %}
+
+                {% if patient_code %}
+                <div class="text-muted small">Mã bệnh nhân: <strong>{{ patient_code }}</strong></div>
+                {% endif %}
               </div>
-              <a class="btn btn-outline-primary btn-sm" href="/charts_emg">
-                Xem biểu đồ EMG
-              </a>
+
+              <div class="d-flex gap-2">
+                <a class="btn btn-outline-success btn-sm"
+                   href="/session/export_csv{% if patient_code %}?patient_code={{ patient_code }}{% endif %}"
+                   target="_blank">
+                  Lưu CSV
+                </a>
+
+                <a class="btn btn-outline-primary btn-sm" href="/charts_emg">EMG</a>
+
+                <button id="btnNextEx" class="btn btn-primary btn-sm">
+                  Bài tập tiếp theo
+                </button>
+              </div>
+
             </div>
           </div>
 
@@ -2357,19 +2792,56 @@ body.sb-collapsed .sidebar *{
           <div class="panel"><h6>Ankle (độ)</h6><div class="chart-box"><canvas id="ankleChart"></canvas></div></div>
         </div>
 
-        <!-- Đánh giá -->
         <div class="col-lg-3">
-          <div class="eval-panel">
-            <div class="eval-header mb-2">Đánh giá từng góc khớp</div>
+          <div class="eval-panel mb-3">
+            <div class="eval-header mb-1">Đánh giá FMA</div>
 
             <div id="evalContent">
               <div class="d-flex align-items-center justify-content-center py-4">
                 <div class="spinner-border text-primary me-2"></div>
-                <span class="small text-muted">Đang chờ dữ liệu phiên đo…</span>
+                <span class="small text-muted">Đang xử lý...</span>
               </div>
             </div>
 
+            <hr class="my-2">
+
+            <div id="totalBox" class="small mb-2">
+              <span class="me-1 fw-semibold">Điểm bài hiện tại:</span>
+              <span id="totalScore" class="badge bg-primary ms-1">0 / 2</span>
+            </div>
+
+            <hr class="my-2">
+            <div class="small fw-bold mb-1">Tổng kết các bài đã đo</div>
+            <div id="allExercisesSummary" class="small"></div>
+
           </div>
+
+          <!-- Bảng EMG -->
+          <div class="panel">
+            <div class="eval-header mb-1">Tín hiệu điện cơ EMG</div>
+            <table class="table table-sm mb-0">
+              <tbody>
+                <tr>
+                  <th scope="row">Cơ đùi</th>
+                  <td class="text-end">
+                    <span style="
+                        background:#dcfce7;
+                        color:#166534;
+                        padding:4px 10px;
+                        border-radius:8px;
+                        font-weight:600;
+                        font-size:0.85rem;
+                    ">Khỏe</span>
+                  </td>
+                </tr>
+                <tr>
+                  <th scope="row">Cơ cẳng chân</th>
+                  <td class="text-end text-muted">—</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
         </div>
 
       </div>
@@ -2379,18 +2851,50 @@ body.sb-collapsed .sidebar *{
 </div>
 
 <script>
-// ===== Toggle sidebar =====
 document.getElementById("btnToggleSB").onclick = () =>
   document.body.classList.toggle("sb-collapsed");
 
-// ===== Data =====
-const t_ms   = {{ t_ms|tojson }};
-const hipArr = {{ hip|tojson }};
-const kneeArr= {{ knee|tojson }};
-const ankleArr={{ ankle|tojson }};
-const evalBox = document.getElementById("evalContent");
+// Dữ liệu từ server
+// Dữ liệu từ server (thô)
+const t_ms_raw    = {{ t_ms|tojson }};
+const hip_raw     = {{ hip|tojson }};
+const knee_raw    = {{ knee|tojson }};
+const ankle_raw   = {{ ankle|tojson }};
+const currentExerciseName = {{ (exercise_name or '')|tojson }};
+const patientCode         = {{ (patient_code or '')|tojson }};
 
-// ===== Biểu đồ =====
+// ===== CHỈ LẤY 5 GIÂY CUỐI (có thể đổi WINDOW_MS = 3000 cho 3s) =====
+const WINDOW_MS = 6000;
+
+let t_ms    = t_ms_raw;
+let hipArr  = hip_raw;
+let kneeArr = knee_raw;
+let ankleArr= ankle_raw;
+
+if (t_ms_raw && t_ms_raw.length) {
+  const lastT = t_ms_raw[t_ms_raw.length - 1];
+  const minT  = lastT - WINDOW_MS;
+
+  // tìm index đầu tiên >= minT
+  let startIdx = 0;
+  while (startIdx < t_ms_raw.length && t_ms_raw[startIdx] < minT) {
+    startIdx++;
+  }
+
+  // nếu khoảng đo dài hơn WINDOW_MS thì cắt
+  if (startIdx > 0 && startIdx < t_ms_raw.length) {
+    t_ms     = t_ms_raw.slice(startIdx);
+    hipArr   = hip_raw.slice(startIdx);
+    kneeArr  = knee_raw.slice(startIdx);
+    ankleArr = ankle_raw.slice(startIdx);
+  }
+}
+
+
+
+const evalBox = document.getElementById("evalContent");
+const totalScoreSpan = document.getElementById("totalScore");
+
 const commonOptions = {
   responsive:true, maintainAspectRatio:false,
   interaction:{ mode:"index", intersect:false },
@@ -2404,7 +2908,7 @@ const commonOptions = {
 function makeChart(id, arr){
   new Chart(document.getElementById(id), {
     type:"line",
-    data:{ labels:t_ms, datasets:[{data:arr, borderColor:"#1973d4", tension:0.15}]},
+    data:{ labels:t_ms, datasets:[{data:arr, borderWidth:2, tension:0.15 }]},
     options:commonOptions
   });
 }
@@ -2413,86 +2917,213 @@ makeChart("hipChart", hipArr);
 makeChart("kneeChart", kneeArr);
 makeChart("ankleChart", ankleArr);
 
-// ===== Đánh giá =====
-function analyze(arr){
-  if(!arr || !arr.length)
-    return {has:false,status:"Chưa có dữ liệu",badge:"secondary",note:"Cần đo phiên mới.",rom:0,max:0,min:0,score:0};
-
-  let max=Math.max(...arr), min=Math.min(...arr), rom=max-min;
-  let status,badge,note;
-
-  if(rom>=60){ status="Tốt"; badge="success"; note="Biên độ vận động tốt."; }
-  else if(rom>=30){ status="Trung bình"; badge="warning"; note="Còn hạn chế, nên tập thêm."; }
-  else{ status="Thấp"; badge="danger"; note="Biên độ rất thấp, nên tham khảo bác sĩ."; }
-
-  // Thang điểm 0–10 theo ROM
-  let score = 0;
-  if(rom >= 60) score = 10;
-  else if(rom >= 50) score = 8;
-  else if(rom >= 40) score = 6;
-  else if(rom >= 30) score = 4;
-  else if(rom >= 20) score = 2;
-  else score = 1;
-
-  return {has:true,status,badge,note,rom,max,min,score};
+// Quy tắc FMA (demo)
+function fmaScore(rom){
+  if (rom >= 90) return 2;
+  if (rom >= 40 && rom<=50) return 1;
+  return 0;
 }
 
-if(t_ms.length>0){
-  function block(name, ev){
-    return `
-      <div class="eval-item">
-        <div class="d-flex justify-content-between">
-          <strong>${name}</strong>
-          <span class="badge bg-${ev.badge}">${ev.status}</span>
-        </div>
-        <div class="small text-muted mt-1">
-          Chênh lệch: ${ev.rom.toFixed(1)}° — Max ${ev.max.toFixed(1)}° / Min ${ev.min.toFixed(1)}°
-        </div>
-        <div class="small">${ev.note}</div>
-        <div class="small mt-1"><em>Điểm: <strong>${ev.score}/10</strong></em></div>
-      </div>`;
+// Chuyển điểm FMA -> nhận xét cơ gối
+function strengthInfo(score){
+  score = Number(score) || 0;
+  if (score >= 2){
+    return {
+      label: "Tốt",
+      desc:  "Biên độ vận động lớn, kiểm soát động tác tốt.",
+      badgeClass: "bg-success"
+    };
+  }
+  if (score === 1){
+    return {
+      label: "Trung bình",
+      desc:  "Biên độ vận động ở mức chấp nhận được, nên tiếp tục tập để cải thiện.",
+      badgeClass: "bg-warning text-dark"
+    };
+  }
+  return {
+    label: "Yếu",
+      desc:  "Biên độ vận động còn hạn chế, cần tăng cường tập luyện và theo dõi.",
+      badgeClass: "bg-danger"
+  };
+}
+
+// ====== LẤY ĐIỂM ĐÃ LƯU TỪ LOCALSTORAGE ======
+let storedScores = {};
+try {
+  storedScores = JSON.parse(localStorage.getItem("exerciseScores") || "{}");
+} catch(e) {
+  storedScores = {};
+}
+
+// Thứ tự chuẩn các bài
+const defaultOrder = ["ankle flexion","knee flexion","hip flexion"];
+// exerciseOrder: gộp default + các key đã lưu, bỏ trùng
+const exerciseOrder = Array.from(new Set([...defaultOrder, ...Object.keys(storedScores)]));
+
+function showCurrentExerciseScore(){
+  if (!currentExerciseName){
+    evalBox.innerHTML = "<div class='text-muted'>Chưa có tên bài tập.</div>";
+    totalScoreSpan.textContent = "0 / 2";
+    return;
   }
 
-  const hip=analyze(hipArr), knee=analyze(kneeArr), ankle=analyze(ankleArr);
+  const data = storedScores[currentExerciseName];
 
-  // Chèn 3 block + hộp tổng điểm
-  evalBox.innerHTML =
-    block("Hip",hip) +
-    block("Knee",knee) +
-    block("Ankle",ankle) +
-    `
-    <div class="score-box mt-3">
-      <div class="mb-2 fw-bold text-primary">🎯 Đánh giá thang điểm</div>
-      <div>Hip: <strong>${hip.score}/10</strong></div>
-      <div>Knee: <strong>${knee.score}/10</strong></div>
-      <div>Ankle: <strong>${ankle.score}/10</strong></div>
+  // Nếu không có trong localStorage → tính trực tiếp từ kneeArr của phiên hiện tại
+  if (!data){
+    if (!kneeArr.length){
+      evalBox.innerHTML = "<div class='text-muted'>Không có dữ liệu ROM cho bài hiện tại.</div>";
+      totalScoreSpan.textContent = "0 / 2";
+      return;
+    }
 
-      <hr>
+    const maxK = Math.max(...kneeArr);
+    const minK = Math.min(...kneeArr);
+    const rom  = maxK - minK;
+    const score = fmaScore(rom);
+    const info  = strengthInfo(score);
 
-      <div class="score-total text-center">
-        Tổng điểm: <span id="totalScore"></span>/30
+    evalBox.innerHTML = `
+      <div class='eval-item'>
+        <div class='strength-label mb-1'>${info.label}</div>
+        <div class="fma-note-box p-3 my-2">
+          <div class='strength-desc mb-0'>${info.desc}</div>
+        </div>
       </div>
-      <div class="text-center mt-2 health-status" id="healthStatus"></div>
-    </div>
     `;
 
-  // ===== Tổng điểm & sức khỏe tổng quan =====
-  const total = hip.score + knee.score + ankle.score;
-  document.getElementById("totalScore").textContent = total;
+    totalScoreSpan.textContent = `${score} / 2`;
+    totalScoreSpan.className = "badge ms-1 " + info.badgeClass;
+    return;
+  }
 
-  let health = "";
-  if(total >= 25) health = "💙 Rất tốt — Biên độ vận động gần như bình thường.";
-  else if(total >= 18) health = " Khá — Vẫn cần cải thiện thêm.";
-  else if(total >= 12) health = " Trung bình — Nên tăng cường tập luyện.";
-  else health = "🔴 Thấp — Biên độ hạn chế, nên gặp chuyên gia phục hồi chức năng.";
+  // Có dữ liệu lưu trong localStorage
+  const romKnee = Number(data.romKnee || 0);
 
-  document.getElementById("healthStatus").textContent = health;
+  let maxK, minK;
+  if (typeof data.maxKnee === "number" && typeof data.minKnee === "number") {
+    maxK = data.maxKnee;
+    minK = data.minKnee;
+  } else if (kneeArr.length) {
+    maxK = Math.max(...kneeArr);
+    minK = Math.min(...kneeArr);
+  } else {
+    maxK = romKnee;
+    minK = 0;
+  }
+
+  const info = strengthInfo(data.score);
+
+  evalBox.innerHTML = `
+    <div class='eval-item'>
+      <div class='strength-label mb-1'>${info.label}</div>
+      <div class="fma-note-box p-3 my-2">
+        <div class='strength-desc mb-0'>${info.desc}</div>
+      </div>
+    </div>
+  `;
+
+  totalScoreSpan.textContent = `${data.score} / 2`;
+  totalScoreSpan.className = "badge ms-1 " + info.badgeClass;
 }
+
+// ====== TỔNG KẾT TẤT CẢ BÀI ĐÃ ĐO (hiện ở dưới) ======
+const allSummaryDiv = document.getElementById("allExercisesSummary");
+
+function renderAllExercisesSummary(){
+  if (!allSummaryDiv) return;
+
+  const keys = Object.keys(storedScores);
+  if (!keys.length){
+    allSummaryDiv.innerHTML = "<div class='text-muted'>Chưa có bài nào được lưu.</div>";
+    return;
+  }
+
+  let html = "";
+  let total = 0;
+
+  // Sắp theo thứ tự defaultOrder nếu có, rồi tới các bài khác
+  const sortedNames = [...keys].sort((a, b) => {
+    const ia = defaultOrder.indexOf(a);
+    const ib = defaultOrder.indexOf(b);
+    if (ia === -1 && ib === -1) return a.localeCompare(b);
+    if (ia === -1) return 1;
+    if (ib === -1) return -1;
+    return ia - ib;
+  });
+
+  sortedNames.forEach((name, idx) => {
+    const d = storedScores[name];
+    if (!d) return;
+
+    total += d.score || 0;
+    const info = strengthInfo(d.score);
+
+    html += `
+      <div class='eval-item'>
+        <div class='d-flex justify-content-between align-items-center'>
+          <div>
+            <div class='fw-semibold'>${idx+1}. ${name}</div>
+            <div class='small text-muted'>
+              ROM Knee: ${(d.romKnee || 0).toFixed(1)}°
+              – <span class='strength-label'>${info.label}</span>
+            </div>
+          </div>
+          <span class='eval-badge badge ${info.badgeClass}'>${d.score} / 2</span>
+        </div>
+      </div>
+    `;
+  });
+
+  html += `
+    <div class='total-summary'>
+      Tổng điểm các bài đã đo:
+      <span>${total} / ${sortedNames.length * 2}</span>
+    </div>
+  `;
+
+  allSummaryDiv.innerHTML = html;
+}
+
+showCurrentExerciseScore();
+renderAllExercisesSummary();
+
+// ====== NÚT "TIẾP THEO" → CHUYỂN SANG BÀI TIẾP THEO ĐỂ ĐO ======
+const btnNext = document.getElementById("btnNextEx");
+
+btnNext.onclick = () => {
+  const idx = exerciseOrder.indexOf(currentExerciseName);
+
+  // Nếu còn bài sau -> sang trang chủ với next_ex
+  if (idx >= 0 && idx < exerciseOrder.length - 1){
+    const nextName = exerciseOrder[idx + 1];
+
+    let url = "/?next_ex=" + encodeURIComponent(nextName);
+    if (patientCode) {
+      url += "&patient_code=" + encodeURIComponent(patientCode);
+    }
+
+    window.location.href = url;
+    return;
+  }
+
+  // Đã là bài cuối cùng
+  let url = "/";
+  if (patientCode) {
+    url += "?patient_code=" + encodeURIComponent(patientCode);
+  }
+  alert("Đã hoàn thành các bài tập. Hệ thống sẽ quay lại trang đo.");
+  window.location.href = url;
+};
 </script>
 
 </body>
 </html>
 """
+
+
+
 
 EMG_CHART_HTML = """<!doctype html>
 <html lang="vi"><head>
@@ -2772,6 +3403,7 @@ body{ background:#e8f3ff; }
                 <label class="form-label">Chiều cao (cm)</label>
                 <input id="height" class="form-control input-sm">
               </div>
+              <input type="hidden" id="pat_code">
               <div class="col-6">
                 <label class="form-label">Cân nặng (kg)</label>
                 <input id="weight" class="form-control input-sm">
@@ -2967,7 +3599,7 @@ def api_receive_imu():
         return {"ok": False, "msg": "Thiếu dữ liệu"}, 400
 
     # --- Giới hạn góc hợp lý theo sinh học ---
-    def clamp(val, lo, hi):
+    def clamp_local(val, lo, hi):
         return max(lo, min(hi, val))
 
     raw_hip = norm_deg(p2 - p1)
