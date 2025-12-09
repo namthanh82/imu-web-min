@@ -1,0 +1,18 @@
+{
+  "Thành11260906": {
+    "DateOfBirth": "08/02/2004",
+    "Exercise": {
+      "20251126_100525": {
+        "csv_file": "exports\\Thành11260906_20251126_100525_73rows.csv",
+        "export_time": "20251126_100525",
+        "n_samples": 73
+      }
+    },
+    "Gender": "Male",
+    "Height": "168",
+    "ID": "031204007328",
+    "PatientCode": "Thành11260906",
+    "Weight": "61",
+    "name": "Nguyễn Nam Thành"
+  }
+}
