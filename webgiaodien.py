@@ -337,8 +337,8 @@ USERS = {"komlab": generate_password_hash("123456")}  # đổi khi deploy
 
 # Map bài tập -> đường dẫn video (trong static/videos/)
 EXERCISE_VIDEOS = {
-    "ankle flexion": "/static/videos/ankle flexion.mp4",
-    "hip flexion": "/static/videos/hip flexion.mp4",
+    "ankle flexion": "/static/ankle flexion.mp4",
+    "hip flexion": "/static/hip flexion.mp4",
     "knee flexion": "/static/knee flexion.mp4",
 }
 
@@ -3630,6 +3630,7 @@ if __name__ == "__main__":
         debug=True,
         allow_unsafe_werkzeug=True
     )
+
 
 
 
