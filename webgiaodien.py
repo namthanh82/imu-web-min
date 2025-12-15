@@ -1407,29 +1407,33 @@ body::after{
 
 </body></html>
 """
-CALIBRATION_HTML = """
-<!doctype html><html lang="vi"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Hiệu chuẩn</title>
+CALIBRATION_HTML = """ 
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title data-i18n="calib.page_title">Hiệu chuẩn</title>
+
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+
 <style>
 :root{ --blue:#1669c9; --sbw:260px; }
 
-/* Nền + font giống các trang khác */
 body{
   background:#e8f3ff;
   margin:0;
   font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
-/* Bố cục & sidebar giống Patients/Charts */
 .layout{
   display:flex;
   gap:16px;
   position:relative;
 }
 .sidebar{
-  background:var(--blue); color:#fff;
+  background:var(--blue);
+  color:#fff;
   border-top-right-radius:16px;
   border-bottom-right-radius:16px;
   padding:16px;
@@ -1441,14 +1445,13 @@ body{
   flex:0 0 var(--sbw);
   max-width:var(--sbw);
   transition:flex-basis .28s ease, max-width .28s ease, transform .28s ease;
-  will-change:flex-basis,max-width,transform;
 }
 .main-col{
   flex:1 1 auto;
   min-width:0;
 }
 
-/* Sidebar thu gọn khi bấm 3 gạch */
+/* collapsed sidebar */
 .sb-collapsed .sidebar-col{
   flex-basis:0;
   max-width:0;
@@ -1463,7 +1466,7 @@ body{
   display:none;
 }
 
-/* Nút 3 gạch trên navbar */
+/* Navbar toggle button */
 #btnToggleSB{
   border:2px solid #d8e6ff;
   border-radius:10px;
@@ -1473,7 +1476,7 @@ body{
 }
 #btnToggleSB:hover{ background:#f4f8ff; }
 
-/* Nút menu bên trái */
+/* Menu buttons */
 .menu-btn{
   width:100%;
   display:block;
@@ -1487,84 +1490,144 @@ body{
   text-align:left;
   text-decoration:none;
 }
-.menu-btn:hover{ background:#1f80ea; color:#fff; }
+.menu-btn:hover{ background:#1f80ea; }
 .menu-btn.active{ background:#0f5bb0; }
 
-/* Khung video chính giữa */
+/* Video block */
 .video-card{
   background:#ffffff;
   border-radius:18px;
   box-shadow:0 10px 30px rgba(15,23,42,.16);
   padding:18px 18px 22px;
   max-width:1100px;
-  margin:24px auto 32px auto;  /* căn giữa */
+  margin:24px auto 32px auto;
 }
 .video-title{
   font-weight:700;
   color:#0a3768;
   margin-bottom:12px;
 }
-.video-frame{
-  border-radius:16px;
-  overflow:hidden;
-  background:#000;
-}
 .video-frame video{
   width:100%;
   height:100%;
-  display:block;
+  border-radius:16px;
 }
 </style>
 </head>
+
 <body class="sb-collapsed">
 
 <nav class="navbar bg-white shadow-sm px-3">
   <div class="container-fluid d-flex align-items-center">
     <button id="btnToggleSB" class="btn me-2">☰</button>
-    <span class="navbar-brand mb-0">Xin chào, {{username}}</span>
+
+    <span class="navbar-brand mb-0">
+      <span data-i18n="nav.hello">Xin chào,</span> {{username}}
+    </span>
+
     <div class="ms-auto d-flex align-items-center gap-2">
-      <img src="{{ url_for('static', filename='unnamed.png') }}" alt="Logo" height="40">
+      <img src="{{ url_for('static', filename='unnamed.png') }}"
+           alt="Logo" height="40">
     </div>
   </div>
 </nav>
 
 <div class="container-fluid my-3">
   <div class="layout">
+
     <!-- Sidebar -->
     <aside class="sidebar-col">
       <div class="sidebar">
-        <div class="mb-2 fw-bold">MENU</div>
-        <a class="menu-btn" href="/">Trang chủ</a>
-        <a class="menu-btn active" href="/calibration">Hiệu chuẩn</a>
-        <a class="menu-btn" href="/patients/manage">Thông tin bệnh nhân</a>
-        <a class="menu-btn" href="/records">Bệnh án</a>
-        <a class="menu-btn" href="/charts">Biểu đồ</a>
-        <a class="menu-btn" href="/settings">Cài đặt</a>
+        <div class="mb-2 fw-bold" data-i18n="menu.title">MENU</div>
+
+        <a class="menu-btn" href="/"                data-i18n="menu.home">Trang chủ</a>
+        <a class="menu-btn active" href="/calibration" data-i18n="menu.calib">Hiệu chuẩn</a>
+        <a class="menu-btn" href="/patients/manage" data-i18n="menu.patinfo">Thông tin bệnh nhân</a>
+        <a class="menu-btn" href="/records"        data-i18n="menu.records">Bệnh án</a>
+        <a class="menu-btn" href="/charts"         data-i18n="menu.charts">Biểu đồ</a>
+        <a class="menu-btn" href="/settings"       data-i18n="menu.settings">Cài đặt</a>
       </div>
     </aside>
 
-    <!-- Main -->
+    <!-- Main content -->
     <main class="main-col">
       <div class="video-card">
-        <div class="video-title">HƯỚNG DẪN HIỆU CHUẨN IMU</div>
+        <div class="video-title" data-i18n="calib.title">HƯỚNG DẪN HIỆU CHUẨN IMU</div>
+
         <div class="video-frame ratio ratio-16x9">
           <video autoplay loop muted controls playsinline>
             <source src="{{ url_for('static', filename='videos/calibration_loop.mp4') }}" type="video/mp4">
-            Trình duyệt của bạn không hỗ trợ video.
           </video>
         </div>
       </div>
     </main>
+
   </div>
 </div>
 
 <script>
-document.getElementById('btnToggleSB').addEventListener('click', () => {
+// ============= I18N DICTIONARY =============
+const I18N = {
+  vi: {
+    "nav.hello": "Xin chào,",
+    "menu.title": "MENU",
+    "menu.home": "Trang chủ",
+    "menu.calib": "Hiệu chuẩn",
+    "menu.patinfo": "Thông tin bệnh nhân",
+    "menu.records": "Bệnh án",
+    "menu.charts": "Biểu đồ",
+    "menu.settings": "Cài đặt",
+
+    "calib.page_title": "Hiệu chuẩn",
+    "calib.title": "HƯỚNG DẪN HIỆU CHUẨN IMU",
+  },
+  en: {
+    "nav.hello": "Hello,",
+    "menu.title": "MENU",
+    "menu.home": "Home",
+    "menu.calib": "Calibration",
+    "menu.patinfo": "Patient info",
+    "menu.records": "Records",
+    "menu.charts": "Charts",
+    "menu.settings": "Settings",
+
+    "calib.page_title": "Calibration",
+    "calib.title": "IMU CALIBRATION GUIDE",
+  }
+};
+
+// ============= Apply language =============
+function applyLanguage(lang){
+  const dict = I18N[lang] || I18N.vi;
+
+  document.querySelectorAll("[data-i18n]").forEach(el=>{
+    const k = el.getAttribute("data-i18n");
+    if (dict[k]) el.textContent = dict[k];
+  });
+
+  const titleEl = document.querySelector("title[data-i18n]");
+  if (titleEl){
+    const key = titleEl.getAttribute("data-i18n");
+    if (dict[key]) titleEl.textContent = dict[key];
+  }
+}
+
+// ============= Sidebar toggle =============
+document.getElementById('btnToggleSB').onclick = () => {
   document.body.classList.toggle('sb-collapsed');
+};
+
+// ============= Load language at startup =============
+document.addEventListener("DOMContentLoaded", ()=>{
+  const lang = localStorage.getItem("appLang") || "vi";
+  applyLanguage(lang);
 });
 </script>
-</body></html>
+
+</body>
+</html>
 """
+
 RECORD_HTML = """
 <!doctype html>
 <html lang="vi">
@@ -2083,10 +2146,11 @@ body{ background:#fafbfe }
     <!-- Sidebar -->
     <aside class="sidebar-col">
       <div class="sidebar">
-        <div class="mb-2 fw-bold" data-i18n="sidebar.menu_title">MENU</div>
+        <div class="mb-2 fw-bold" data-i18n="menu.title">MENU</div>
         <a class="menu-btn" href="/"                data-i18n="menu.home">Trang chủ</a>
         <a class="menu-btn" href="/calibration"     data-i18n="menu.calib">Hiệu chuẩn</a>
         <a class="menu-btn" href="/patients/manage" data-i18n="menu.patinfo">Thông tin bệnh nhân</a>
+        <a class="menu-btn" href="/patients"        data-i18n="menu.review">Xem lại</a>
         <a class="menu-btn" href="/records"         data-i18n="menu.record">Bệnh án</a>
         <a class="menu-btn" href="/charts"          data-i18n="menu.charts">Biểu đồ</a>
         <a class="menu-btn" href="/settings"        data-i18n="menu.settings">Cài đặt</a>
@@ -2100,18 +2164,24 @@ body{ background:#fafbfe }
           <div class="panel mb-3">
             <div class="d-flex gap-2">
               <!-- Nút này được JS bắt sự kiện để mở modal -->
-              <a class="btn btn-outline-thick flex-fill" href="#" id="btnPatientList" data-i18n="btn.patient_list">Danh sách bệnh nhân</a>
-              <a class="btn btn-outline-thick flex-fill" href="/patients/new" data-i18n="btn.patient_new">Thêm bệnh nhân mới</a>
+              <a class="btn btn-outline-thick flex-fill" href="#" id="btnPatientList" data-i18n="dash.patient_list">Danh sách bệnh nhân</a>
+              <a class="btn btn-outline-thick flex-fill" href="/patients/new" data-i18n="dash.add_patient">Thêm bệnh nhân mới</a>
             </div>
             <div class="mt-3 d-flex align-items-center gap-3">
-              <label class="form-label mb-0" data-i18n="label.heart_rate">Nhịp tim :</label>
+              <label class="form-label mb-0" data-i18n="dash.heart_label">Nhịp tim :</label>
               <input class="form-control" id="heartRate" style="max-width:180px">
-              <span class="badge text-bg-light border" data-i18n="unit.bpm">bpm</span>
+              <span class="badge text-bg-light border" data-i18n="dash.heart_unit">bpm</span>
             </div>
             <div class="mt-3 panel">
               <div class="table-responsive">
                 <table class="table table-sm align-middle">
-                  <thead><tr><th>Hip</th><th>Knee</th><th>Ankle</th></tr></thead>
+                  <thead>
+                    <tr>
+                      <th data-i18n="dash.hip">Hip</th>
+                      <th data-i18n="dash.knee">Knee</th>
+                      <th data-i18n="dash.ankle">Ankle</th>
+                    </tr>
+                  </thead>
                   <tbody id="tblAngles"><tr><td>--</td><td>--</td><td>--</td></tr></tbody>
                 </table>
               </div>
@@ -2176,8 +2246,8 @@ body{ background:#fafbfe }
         <div class="col-lg-7 pull-up-guide">
           <div class="panel">
             <div class="d-flex align-items-center justify-content-between mb-2">
-              <span class="title-chip" data-i18n="three.title">MÔ PHỎNG 3D</span>
-              <div class="small text-muted" data-i18n="three.source">Nguồn: hip/knee/ankle từ IMU (độ)</div>
+              <span class="title-chip" data-i18n="dash.3d_title">MÔ PHỎNG 3D</span>
+              <div class="small text-muted" data-i18n="dash.3d_source">Nguồn: hip/knee/ankle từ IMU (độ)</div>
             </div>
             <div id="threeMount" style="width:100%; height:480px; min-height:480px; border-radius:14px; overflow:visible; position:relative; z-index:1;">
             </div>
@@ -2187,7 +2257,7 @@ body{ background:#fafbfe }
               <span class="badge text-bg-light border">Ankle: <span id="liveAnkle">--</span>°</span>
             </div>
             <div class="mt-3 text-center">
-              <button class="btn btn-outline-thick px-4 py-2" id="btnResetPose3D" data-i18n="btn.reset3d">Reset 3D</button>
+              <button class="btn btn-outline-thick px-4 py-2" id="btnResetPose3D" data-i18n="dash.reset3d">Reset 3D</button>
               <div class="small text-muted mt-2" id="status3D">
                 Đang khởi tạo 3D…
               </div>
@@ -2198,9 +2268,9 @@ body{ background:#fafbfe }
         <!-- NÚT + KẾT QUẢ -->
         <div class="col-lg-5">
           <div class="panel d-grid gap-3">
-            <button class="btn btn-outline-thick py-3" id="btnStart" data-i18n="btn.start">Bắt đầu đo</button>
-            <button class="btn btn-outline-thick py-3" id="btnStop"  data-i18n="btn.stop">Kết thúc đo</button>
-            <button class="btn btn-outline-thick py-3" id="btnSave"  data-i18n="btn.save">Lưu kết quả</button>
+            <button class="btn btn-outline-thick py-3" id="btnStart" data-i18n="dash.start_measure">Bắt đầu đo</button>
+            <button class="btn btn-outline-thick py-3" id="btnStop" data-i18n="dash.stop_measure">Kết thúc đo</button>
+            <button class="btn btn-outline-thick py-3" id="btnSave" data-i18n="dash.save_result">Lưu kết quả</button>
 
             <!-- Kết quả bài hiện tại (hiện tại không dùng nữa, để sẵn nếu sau này cần) -->
             <div id="exercise-result-panel" class="mt-3" style="display:none;">
@@ -2209,16 +2279,16 @@ body{ background:#fafbfe }
                 <canvas id="exercise-chart"></canvas>
               </div>
               <div class="mt-2 small">
-                <div>ROM Hip: <span id="rom-hip-text">0°</span></div>
-                <div>ROM Knee: <span id="rom-knee-text">0°</span></div>
-                <div>ROM Ankle: <span id="rom-ankle-text">0°</span></div>
+                <div data-i18n="dash.rom_hip">ROM Hip: <span id="rom-hip-text">0°</span></div>
+                <div data-i18n="dash.rom_knee">ROM Knee: <span id="rom-knee-text">0°</span></div>
+                <div data-i18n="dash.rom_ankle">ROM Ankle: <span id="rom-ankle-text">0°</span></div>
                 <div class="mt-1 fw-bold">
-                  <span data-i18n="result.score_label">Điểm bài này:</span>
+                  <span data-i18n="dash.score_this_ex">Điểm bài này:</span>
                   <span id="score-text">0</span> / 2
                 </div>
               </div>
               <div class="mt-3 d-flex gap-2">
-                <button id="btn-next-ex" class="btn btn-outline-thick flex-grow-1" data-i18n="btn.next_ex">
+                <button id="btn-next-ex" class="btn btn-outline-thick flex-grow-1" data-i18n="dash.next_ex">
                   Bài tập tiếp theo
                 </button>
               </div>
@@ -2226,10 +2296,10 @@ body{ background:#fafbfe }
 
             <!-- Tổng kết tất cả bài (hiện tại không dùng nữa, sẽ tổng hợp ở tab Biểu đồ) -->
             <div id="all-exercise-summary" class="mt-3" style="display:none;">
-              <h6 class="fw-bold" data-i18n="summary.all_title">Tổng kết tất cả bài tập</h6>
+              <h6 class="fw-bold" data-i18n="dash.summary_all">Tổng kết tất cả bài tập</h6>
               <ul class="small mb-2" id="summary-list"></ul>
               <div class="fw-bold">
-                <span data-i18n="summary.total_score">Tổng điểm:</span>
+                <span data-i18n="dash.total_score">Tổng điểm:</span>
                 <span id="total-score-text">0</span>
               </div>
             </div>
@@ -2246,27 +2316,27 @@ body{ background:#fafbfe }
   <div class="modal-dialog modal-lg modal-dialog-scrollable">
     <div class="modal-content">
       <div class="modal-header">
-        <h5 class="modal-title" data-i18n="modal.patient.title">Danh sách bệnh nhân</h5>
+        <h5 class="modal-title" data-i18n="pat.modal_title">Danh sách bệnh nhân</h5>
         <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
       </div>
       <div class="modal-body">
-        <input id="pm_search" class="form-control mb-2" placeholder="Tìm kiếm..." data-i18n-placeholder="modal.patient.search_placeholder">
+        <input id="pm_search" class="form-control mb-2" placeholder="Tìm kiếm..." data-i18n-placeholder="pat.modal_search">
         <div class="table-responsive" style="max-height:400px;">
           <table class="table table-hover align-middle mb-0">
             <thead>
               <tr>
-                <th data-i18n="modal.patient.col_index">#</th>
-                <th data-i18n="modal.patient.col_code">Mã</th>
-                <th data-i18n="modal.patient.col_name">Họ và tên</th>
-                <th data-i18n="modal.patient.col_id">CCCD</th>
-                <th data-i18n="modal.patient.col_dob">Ngày sinh</th>
-                <th data-i18n="modal.patient.col_sex">Giới tính</th>
+                <th data-i18n="pat.th_index">#</th>
+                <th data-i18n="pat.th_code">Mã</th>
+                <th data-i18n="pat.th_name">Họ và tên</th>
+                <th data-i18n="pat.th_cccd">CCCD</th>
+                <th data-i18n="pat.th_dob">Ngày sinh</th>
+                <th data-i18n="pat.th_gender">Giới tính</th>
               </tr>
             </thead>
             <tbody id="pm_body"></tbody>
           </table>
         </div>
-        <div class="small text-muted mt-2" data-i18n="modal.patient.hint">Nhấp đúp vào 1 dòng để chọn bệnh nhân.</div>
+        <div class="small text-muted mt-2" data-i18n="pat.modal_hint">Nhấp đúp vào 1 dòng để chọn bệnh nhân.</div>
       </div>
     </div>
   </div>
@@ -2277,11 +2347,11 @@ body{ background:#fafbfe }
   <div class="modal-dialog modal-lg modal-dialog-centered">
     <div class="modal-content">
       <div class="modal-header">
-        <h5 class="modal-title" id="vasModalTitle" data-i18n="vas.modal.title">Đánh giá mức độ đau (VAS)</h5>
+        <h5 class="modal-title" id="vasModalTitle">Đánh giá mức độ đau (VAS)</h5>
         <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Đóng"></button>
       </div>
       <div class="modal-body">
-        <p class="text-muted mb-3" id="vasModalSubtitle" data-i18n="vas.modal.subtitle">
+        <p class="text-muted mb-3" id="vasModalSubtitle">
           Vui lòng chọn mức độ đau từ 0 (không đau) đến 10 (đau tệ nhất).
         </p>
 
@@ -2318,15 +2388,15 @@ body{ background:#fafbfe }
           </div>
 
           <div class="mt-3">
-            <strong data-i18n="vas.selected_label">Mức đau bạn chọn: </strong>
+            <strong>Mức đau bạn chọn: </strong>
             <span id="vasSelected">0 – Không đau</span>
           </div>
         </div>
       </div>
 
       <div class="modal-footer">
-        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal" data-i18n="vas.btn_cancel">Hủy</button>
-        <button type="button" class="btn btn-primary" id="vasConfirmBtn" data-i18n="vas.btn_ok">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Hủy</button>
+        <button type="button" class="btn btn-primary" id="vasConfirmBtn">
           Xác nhận mức đau
         </button>
       </div>
@@ -2336,6 +2406,138 @@ body{ background:#fafbfe }
 
 <!-- Bootstrap JS (để dùng Modal) -->
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+
+<!-- ===== SIMPLE I18N (VI / EN) ===== -->
+<script>
+const I18N = {
+  vi: {
+    "menu.title": "MENU",
+    "menu.home": "Trang chủ",
+    "menu.calib": "Hiệu chuẩn",
+    "menu.patinfo": "Thông tin bệnh nhân",
+    "menu.review": "Xem lại",
+    "menu.record": "Bệnh án",
+    "menu.charts": "Biểu đồ",
+    "menu.settings": "Cài đặt",
+
+    "dash.patient_list": "Danh sách bệnh nhân",
+    "dash.add_patient": "Thêm bệnh nhân mới",
+    "dash.heart_label": "Nhịp tim :",
+    "dash.heart_unit": "bpm",
+    "dash.hip": "Hip",
+    "dash.knee": "Knee",
+    "dash.ankle": "Ankle",
+    "dash.3d_title": "MÔ PHỎNG 3D",
+    "dash.3d_source": "Nguồn: hip/knee/ankle từ IMU (độ)",
+    "dash.reset3d": "Reset 3D",
+    "dash.start_measure": "Bắt đầu đo",
+    "dash.stop_measure": "Kết thúc đo",
+    "dash.save_result": "Lưu kết quả",
+    "dash.rom_hip": "ROM Hip:",
+    "dash.rom_knee": "ROM Knee:",
+    "dash.rom_ankle": "ROM Ankle:",
+    "dash.score_this_ex": "Điểm bài này:",
+    "dash.next_ex": "Bài tập tiếp theo",
+    "dash.summary_all": "Tổng kết tất cả bài tập",
+    "dash.total_score": "Tổng điểm:",
+
+    "pat.name": "Họ và tên :",
+    "pat.dob": "Ngày sinh :",
+    "pat.id": "CCCD :",
+    "pat.gender": "Giới tính :",
+    "pat.weight": "Cân nặng :",
+    "pat.height": "Chiều cao :",
+    "pat.exercise": "Bài kiểm tra :",
+    "pat.measure_date": "Ngày đo :",
+
+    "pat.modal_title": "Danh sách bệnh nhân",
+    "pat.modal_search": "Tìm kiếm...",
+    "pat.th_index": "#",
+    "pat.th_code": "Mã",
+    "pat.th_name": "Họ và tên",
+    "pat.th_cccd": "CCCD",
+    "pat.th_dob": "Ngày sinh",
+    "pat.th_gender": "Giới tính",
+    "pat.modal_hint": "Nhấp đúp vào 1 dòng để chọn bệnh nhân."
+  },
+
+  en: {
+    "menu.title": "MENU",
+    "menu.home": "Home",
+    "menu.calib": "Calibration",
+    "menu.patinfo": "Patient info",
+    "menu.review": "Review",
+    "menu.record": "Medical record",
+    "menu.charts": "Charts",
+    "menu.settings": "Settings",
+
+    "dash.patient_list": "Patient list",
+    "dash.add_patient": "Add new patient",
+    "dash.heart_label": "Heart rate:",
+    "dash.heart_unit": "bpm",
+    "dash.hip": "Hip",
+    "dash.knee": "Knee",
+    "dash.ankle": "Ankle",
+    "dash.3d_title": "3D Simulation",
+    "dash.3d_source": "Source: hip/knee/ankle from IMU (deg)",
+    "dash.reset3d": "Reset 3D",
+    "dash.start_measure": "Start measurement",
+    "dash.stop_measure": "Stop measurement",
+    "dash.save_result": "Save results",
+    "dash.rom_hip": "ROM Hip:",
+    "dash.rom_knee": "ROM Knee:",
+    "dash.rom_ankle": "ROM Ankle:",
+    "dash.score_this_ex": "Score for this exercise:",
+    "dash.next_ex": "Next exercise",
+    "dash.summary_all": "Summary of all exercises",
+    "dash.total_score": "Total score:",
+
+    "pat.name": "Full name:",
+    "pat.dob": "Date of birth:",
+    "pat.id": "National ID:",
+    "pat.gender": "Gender:",
+    "pat.weight": "Weight:",
+    "pat.height": "Height:",
+    "pat.exercise": "Exercise:",
+    "pat.measure_date": "Measurement date:",
+
+    "pat.modal_title": "Patient list",
+    "pat.modal_search": "Search...",
+    "pat.th_index": "#",
+    "pat.th_code": "Code",
+    "pat.th_name": "Full name",
+    "pat.th_cccd": "National ID",
+    "pat.th_dob": "Date of birth",
+    "pat.th_gender": "Gender",
+    "pat.modal_hint": "Double-click a row to select patient."
+  }
+};
+
+function applyLanguage(lang){
+  const dict = I18N[lang] || I18N.vi;
+
+  // innerText
+  document.querySelectorAll("[data-i18n]").forEach(el => {
+    const key = el.getAttribute("data-i18n");
+    const txt = dict[key];
+    if (!txt) return;
+    el.textContent = txt;
+  });
+
+  // placeholder
+  document.querySelectorAll("[data-i18n-placeholder]").forEach(el => {
+    const key = el.getAttribute("data-i18n-placeholder");
+    const txt = dict[key];
+    if (!txt) return;
+    el.placeholder = txt;
+  });
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  const lang = localStorage.getItem("appLang") || "vi";   // lấy từ trang Cài đặt
+  applyLanguage(lang);
+});
+</script>
 
 <script>
 // ===== Video hướng dẫn & sidebar =====
@@ -2741,15 +2943,13 @@ loader.load(
     camera.far  = rad * 20;
     camera.updateProjectionMatrix();
 
-    statusEl.textContent = "✅ Mô hình đã sẵn sàng";
   },
   (progress) => {
     const percent = (progress.loaded / (progress.total || 1)) * 100;
-    statusEl.textContent = "Đang tải mô hình: " + percent.toFixed(0) + "%";
+    statusEl.textContent = `Đang tải mô hình: ${percent.toFixed(0)}%`;
   },
   (err) => {
     console.error("❌ Lỗi load GLB:", err);
-    statusEl.textContent = "❌ Không tải được mô hình 3D.";
   }
 );
 
@@ -3198,33 +3398,6 @@ if (btnStop) btnStop.addEventListener("click", async () => {
   });
 });
 
-// Tự động chọn bài tập khi quay lại từ /charts?next_ex=...
-const urlParams = new URLSearchParams(window.location.search);
-if (urlParams.has("next_ex")) {
-  const nextEx = urlParams.get("next_ex").trim();
-  const sel = document.getElementById("exerciseSelect");
-  if (sel) {
-    const options = [...sel.options].map(o => o.value.toLowerCase());
-    const foundIndex = options.indexOf(nextEx.toLowerCase());
-    if (foundIndex >= 0) {
-      sel.value = sel.options[foundIndex].value;
-    } else {
-      const opt = document.createElement("option");
-      opt.value = nextEx;
-      opt.textContent = nextEx;
-      sel.appendChild(opt);
-      sel.value = nextEx;
-    }
-  }
-  if (typeof window.updateVideo === "function") {
-    window.updateVideo(nextEx);
-  }
-  if (window.EXERCISE_KEYS) {
-    const idx = window.EXERCISE_KEYS.indexOf(nextEx);
-    if (idx >= 0) window.currentExerciseIndex = idx;
-  }
-}
-
 // Khởi tạo VAS + load lại bệnh nhân khi vừa vào trang
 document.addEventListener("DOMContentLoaded", () => {
   resetVASDefault();
@@ -3232,165 +3405,15 @@ document.addEventListener("DOMContentLoaded", () => {
 });
 </script>
 
-<!-- ===== I18N: ĐỔI NGÔN NGỮ DASHBOARD THEO appLang ===== -->
-<script>
-const I18N = {
-  vi: {
-    "sidebar.menu_title": "MENU",
-
-    "menu.home": "Trang chủ",
-    "menu.calib": "Hiệu chuẩn",
-    "menu.patinfo": "Thông tin bệnh nhân",
-    "menu.record": "Bệnh án",
-    "menu.charts": "Biểu đồ",
-    "menu.settings": "Cài đặt",
-
-    "btn.patient_list": "Danh sách bệnh nhân",
-    "btn.patient_new": "Thêm bệnh nhân mới",
-    "label.heart_rate": "Nhịp tim :",
-    "unit.bpm": "bpm",
-
-    "three.title": "MÔ PHỎNG 3D",
-    "three.source": "Nguồn: hip/knee/ankle từ IMU (độ)",
-    "btn.reset3d": "Reset 3D",
-
-    "btn.start": "Bắt đầu đo",
-    "btn.stop": "Kết thúc đo",
-    "btn.save": "Lưu kết quả",
-    "btn.next_ex": "Bài tập tiếp theo",
-    "result.score_label": "Điểm bài này:",
-    "summary.all_title": "Tổng kết tất cả bài tập",
-    "summary.total_score": "Tổng điểm:",
-
-    "modal.patient.title": "Danh sách bệnh nhân",
-    "modal.patient.search_placeholder": "Tìm kiếm...",
-    "modal.patient.col_index": "#",
-    "modal.patient.col_code": "Mã",
-    "modal.patient.col_name": "Họ và tên",
-    "modal.patient.col_id": "CCCD",
-    "modal.patient.col_dob": "Ngày sinh",
-    "modal.patient.col_sex": "Giới tính",
-    "modal.patient.hint": "Nhấp đúp vào 1 dòng để chọn bệnh nhân.",
-
-    "vas.modal.title": "Đánh giá mức độ đau (VAS)",
-    "vas.modal.subtitle": "Vui lòng chọn mức độ đau từ 0 (không đau) đến 10 (đau tệ nhất).",
-    "vas.selected_label": "Mức đau bạn chọn: ",
-    "vas.btn_cancel": "Hủy",
-    "vas.btn_ok": "Xác nhận mức đau"
-  },
-  en: {
-    "sidebar.menu_title": "MENU",
-
-    "menu.home": "Home",
-    "menu.calib": "Calibration",
-    "menu.patinfo": "Patient info",
-    "menu.record": "Medical records",
-    "menu.charts": "Charts",
-    "menu.settings": "Settings",
-
-    "btn.patient_list": "Patient list",
-    "btn.patient_new": "Add new patient",
-    "label.heart_rate": "Heart rate:",
-    "unit.bpm": "bpm",
-
-    "three.title": "3D Simulation",
-    "three.source": "Source: hip/knee/ankle from IMU (deg)",
-    "btn.reset3d": "Reset 3D",
-
-    "btn.start": "Start measurement",
-    "btn.stop": "Stop measurement",
-    "btn.save": "Save results",
-    "btn.next_ex": "Next exercise",
-    "result.score_label": "Score of this exercise:",
-    "summary.all_title": "Summary of all exercises",
-    "summary.total_score": "Total score:",
-
-    "modal.patient.title": "Patient list",
-    "modal.patient.search_placeholder": "Search...",
-    "modal.patient.col_index": "#",
-    "modal.patient.col_code": "Code",
-    "modal.patient.col_name": "Full name",
-    "modal.patient.col_id": "National ID",
-    "modal.patient.col_dob": "Date of birth",
-    "modal.patient.col_sex": "Gender",
-    "modal.patient.hint": "Double-click a row to select a patient.",
-
-    "vas.modal.title": "Pain intensity (VAS)",
-    "vas.modal.subtitle": "Please select pain level from 0 (no pain) to 10 (worst pain).",
-    "vas.selected_label": "Selected pain level: ",
-    "vas.btn_cancel": "Cancel",
-    "vas.btn_ok": "Confirm"
-  }
-};
-
-function getCurrentLang(){
-  let lang = "vi";
-  try{
-    const saved = localStorage.getItem("appLang");
-    if (saved === "en" || saved === "vi") lang = saved;
-  }catch(e){}
-  return lang;
-}
-
-function applyLanguage(lang){
-  const dict = I18N[lang] || I18N.vi;
-
-  // đổi innerText
-  document.querySelectorAll("[data-i18n]").forEach(el => {
-    const key = el.getAttribute("data-i18n");
-    const txt = dict[key];
-    if (!txt) return;
-    el.textContent = txt;
-  });
-
-  // đổi placeholder
-  document.querySelectorAll("[data-i18n-placeholder]").forEach(el => {
-    const key = el.getAttribute("data-i18n-placeholder");
-    const txt = dict[key];
-    if (!txt) return;
-    el.placeholder = txt;
-  });
-}
-const I18N = {
-  vi: {
-    "pat.name": "Họ và tên :",
-    "pat.dob": "Ngày sinh :",
-    "pat.id": "CCCD :",
-    "pat.gender": "Giới tính :",
-    "pat.weight": "Cân nặng :",
-    "pat.height": "Chiều cao :",
-    "pat.exercise": "Bài kiểm tra :",
-    "pat.measure_date": "Ngày đo :",
-  },
-
-  en: {
-    "pat.name": "Full name:",
-    "pat.dob": "Date of birth:",
-    "pat.id": "National ID:",
-    "pat.gender": "Gender:",
-    "pat.weight": "Weight:",
-    "pat.height": "Height:",
-    "pat.exercise": "Exercise:",
-    "pat.measure_date": "Measurement date:",
-  }
-};
-
-
-document.addEventListener("DOMContentLoaded", () => {
-  const lang = getCurrentLang();
-  applyLanguage(lang);
-});
-</script>
-
 </body></html>
 """
-
 
 SETTINGS_HTML = """
 <!doctype html><html lang="vi"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Cài đặt – IMU Dashboard</title>
+<title data-i18n="settings.page_title">Cài đặt – IMU Dashboard</title>
+
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
 
 <style>
@@ -3422,8 +3445,12 @@ body{ background:#fafbfe; font-size:15px; }
 <body>
 <nav class="navbar bg-white shadow-sm px-3">
   <div class="container-fluid d-flex align-items-center">
-    <button class="btn me-2" style="border:2px solid #d8e6ff;border-radius:10px;background:#fff;">☰</button>
-    <span class="navbar-brand mb-0">Xin chào, {{username}}</span>
+    <button id="btnToggleSB" class="btn me-2" style="border:2px solid #d8e6ff;border-radius:10px;background:#fff;">☰</button>
+
+    <span class="navbar-brand mb-0">
+      <span data-i18n="nav.hello">Xin chào,</span> {{username}}
+    </span>
+
     <div class="ms-auto d-flex align-items-center gap-2">
       <img src="{{ url_for('static', filename='unnamed.png') }}" alt="Logo" height="48">
     </div>
@@ -3432,91 +3459,161 @@ body{ background:#fafbfe; font-size:15px; }
 
 <div class="container-fluid my-3">
   <div class="layout">
+
     <!-- Sidebar -->
     <aside class="sidebar-col">
       <div class="sidebar">
-        <div class="mb-2 fw-bold">MENU</div>
-        <a class="menu-btn" href="/">Trang chủ</a>
-        <a class="menu-btn" href="/calibration">Hiệu chuẩn</a>
-        <a class="menu-btn" href="/patients/manage">Thông tin bệnh nhân</a>
-        <a class="menu-btn" href="/patients">Xem lại</a>
-        <a class="menu-btn" href="/records">Bệnh án</a>
-        <a class="menu-btn" href="/charts">Biểu đồ</a>
-        <a class="menu-btn active" href="/settings">Cài đặt</a>
+        <div class="mb-2 fw-bold" data-i18n="menu.title">MENU</div>
+
+        <a class="menu-btn" href="/"                data-i18n="menu.home">Trang chủ</a>
+        <a class="menu-btn" href="/calibration"     data-i18n="menu.calib">Hiệu chuẩn</a>
+        <a class="menu-btn" href="/patients/manage" data-i18n="menu.patinfo">Thông tin bệnh nhân</a>
+        <a class="menu-btn" href="/patients"        data-i18n="menu.review">Xem lại</a>
+        <a class="menu-btn" href="/records"         data-i18n="menu.records">Bệnh án</a>
+        <a class="menu-btn" href="/charts"          data-i18n="menu.charts">Biểu đồ</a>
+        <a class="menu-btn active" href="/settings" data-i18n="menu.settings">Cài đặt</a>
       </div>
     </aside>
 
     <!-- Main -->
     <main class="main-col">
       <div class="panel mb-3">
-        <h5 class="mb-3">Cài đặt hệ thống</h5>
+        <h5 class="mb-3" data-i18n="settings.title">Cài đặt hệ thống</h5>
+
         <div class="row g-3">
           <div class="col-md-4">
-            <label class="form-label">Ngôn ngữ hiển thị</label>
+            <label class="form-label" data-i18n="settings.language">Ngôn ngữ hiển thị</label>
             <select id="languageSelect" class="form-select">
-              <option value="vi">Tiếng Việt</option>
-              <option value="en">English</option>
+              <option value="vi" data-i18n="settings.lang_vi">Tiếng Việt</option>
+              <option value="en" data-i18n="settings.lang_en">English</option>
             </select>
           </div>
         </div>
 
         <div class="mt-4 d-flex gap-2">
-          <button id="btnSaveSettings" class="btn btn-primary">Lưu cài đặt</button>
-          <span id="settingsStatus" class="text-success small" style="display:none;">Đã lưu!</span>
+          <button id="btnSaveSettings" class="btn btn-primary" data-i18n="settings.btn_save">Lưu cài đặt</button>
+          <span id="settingsStatus" class="text-success small" style="display:none;" data-i18n="settings.saved">Đã lưu!</span>
         </div>
       </div>
 
+      <!-- Account block -->
       <div class="panel">
-        <h6 class="mb-2">Tài khoản</h6>
+        <h6 class="mb-2" data-i18n="settings.account_title">Tài khoản</h6>
         <p class="small text-muted mb-3">
-            Đăng xuất khỏi tài khoản <strong>{{username}}</strong> hiện tại.
+          <span data-i18n="settings.logout_text">Đăng xuất khỏi tài khoản</span>
+          <strong>{{username}}</strong>
+          <span data-i18n="settings.logout_suffix">hiện tại.</span>
         </p>
-        <a href="/logout" class="btn btn-outline-danger">Đăng xuất</a>
+        <a href="/logout" class="btn btn-outline-danger" data-i18n="settings.btn_logout">Đăng xuất</a>
       </div>
+
     </main>
   </div>
 </div>
 
 <script>
-// ====== CÀI ĐẶT NGÔN NGỮ ======
-function loadSettings(){
-  let lang = "vi";
-  try{
-    const saved = localStorage.getItem("appLang");
-    if (saved) lang = saved;
-  }catch(e){
-    console.warn("Không đọc được appLang từ localStorage:", e);
+// ===================== I18N TABLE =====================
+const I18N = {
+  vi: {
+    "settings.page_title": "Cài đặt – IMU Dashboard",
+    "nav.hello": "Xin chào,",
+    "menu.title": "MENU",
+    "menu.home": "Trang chủ",
+    "menu.calib": "Hiệu chuẩn",
+    "menu.patinfo": "Thông tin bệnh nhân",
+    "menu.review": "Xem lại",
+    "menu.records": "Bệnh án",
+    "menu.charts": "Biểu đồ",
+    "menu.settings": "Cài đặt",
+
+    "settings.title": "Cài đặt hệ thống",
+    "settings.language": "Ngôn ngữ hiển thị",
+    "settings.lang_vi": "Tiếng Việt",
+    "settings.lang_en": "English",
+    "settings.btn_save": "Lưu cài đặt",
+    "settings.saved": "Đã lưu!",
+    "settings.account_title": "Tài khoản",
+    "settings.logout_text": "Đăng xuất khỏi tài khoản",
+    "settings.logout_suffix": "hiện tại.",
+    "settings.btn_logout": "Đăng xuất"
+  },
+
+  en: {
+    "settings.page_title": "Settings – IMU Dashboard",
+    "nav.hello": "Hello,",
+    "menu.title": "MENU",
+    "menu.home": "Home",
+    "menu.calib": "Calibration",
+    "menu.patinfo": "Patient information",
+    "menu.review": "Review",
+    "menu.records": "Records",
+    "menu.charts": "Charts",
+    "menu.settings": "Settings",
+
+    "settings.title": "System settings",
+    "settings.language": "Display language",
+    "settings.lang_vi": "Vietnamese",
+    "settings.lang_en": "English",
+    "settings.btn_save": "Save settings",
+    "settings.saved": "Saved!",
+    "settings.account_title": "Account",
+    "settings.logout_text": "Log out from account",
+    "settings.logout_suffix": "now.",
+    "settings.btn_logout": "Log out"
   }
-  const sel = document.getElementById("languageSelect");
-  if (sel) sel.value = lang;
-  window.APP_LANG = lang;
+};
+
+// ===================== APPLY LANGUAGE =====================
+function applyLanguage(lang){
+  const dict = I18N[lang] || I18N.vi;
+
+  document.querySelectorAll("[data-i18n]").forEach(el=>{
+    const k = el.getAttribute("data-i18n");
+    if (dict[k]) el.textContent = dict[k];
+  });
+
+  // Placeholder support (nếu cần)
+  document.querySelectorAll("[data-i18n-placeholder]").forEach(el=>{
+    const k = el.getAttribute("data-i18n-placeholder");
+    if (dict[k]) el.placeholder = dict[k];
+  });
+
+  // Update title
+  const titleEl = document.querySelector("title[data-i18n]");
+  if (titleEl){
+    const k = titleEl.getAttribute("data-i18n");
+    if (dict[k]) titleEl.textContent = dict[k];
+  }
+}
+
+// ===================== LOAD & SAVE SETTINGS =====================
+function loadSettings(){
+  let lang = localStorage.getItem("appLang") || "vi";
+  document.getElementById("languageSelect").value = lang;
+  applyLanguage(lang);
 }
 
 function saveSettings(){
-  const sel = document.getElementById("languageSelect");
-  if (!sel) return;
-  const lang = sel.value || "vi";
-  try{
-    localStorage.setItem("appLang", lang);
-  }catch(e){
-    console.warn("Không lưu được appLang:", e);
-  }
-  window.APP_LANG = lang;
+  const lang = document.getElementById("languageSelect").value;
+  localStorage.setItem("appLang", lang);
+  applyLanguage(lang);
+
   const st = document.getElementById("settingsStatus");
-  if (st){
-    st.style.display = "inline";
-    setTimeout(()=>{ st.style.display = "none"; }, 1500);
-  }
-  // nếu muốn áp dụng ngay cho giao diện có thể:
-  // location.reload();
+  st.style.display = "inline";
+  setTimeout(()=> st.style.display = "none", 1500);
 }
 
-document.getElementById("btnSaveSettings").addEventListener("click", saveSettings);
+// ===================== EVENT BINDING =====================
+document.getElementById("btnSaveSettings").onclick = saveSettings;
+document.getElementById("btnToggleSB").onclick = () => {
+  document.body.classList.toggle("sb-collapsed");
+};
+
 document.addEventListener("DOMContentLoaded", loadSettings);
+
 </script>
 </body></html>
 """
-
 
 CHARTS_HTML = """
 <!doctype html>
@@ -3705,13 +3802,13 @@ body.sb-collapsed .sidebar *{
 
     <aside class="sidebar-col">
       <div class="sidebar">
-        <div class="mb-2 fw-bold">MENU</div>
-        <a class="menu-btn" href="/">Trang chủ</a>
-        <a class="menu-btn" href="/calibration">Hiệu chuẩn</a>
-        <a class="menu-btn" href="/patients/manage">Thông tin bệnh nhân</a>
-        <a class="menu-btn" href="/records">Bệnh án</a>
-        <a class="menu-btn active" href="/charts">Biểu đồ</a>
-        <a class="menu-btn" href="/settings">Cài đặt</a>
+        <div class="mb-2 fw-bold" data-i18n="menu.title">MENU</div>
+        <a class="menu-btn" href="/"                 data-i18n="menu.home">Trang chủ</a>
+        <a class="menu-btn" href="/calibration"      data-i18n="menu.calib">Hiệu chuẩn</a>
+        <a class="menu-btn" href="/patients/manage"  data-i18n="menu.patinfo">Thông tin bệnh nhân</a>
+        <a class="menu-btn" href="/records"          data-i18n="menu.record">Bệnh án</a>
+        <a class="menu-btn active" href="/charts"    data-i18n="menu.charts">Biểu đồ</a>
+        <a class="menu-btn" href="/settings"         data-i18n="menu.settings">Cài đặt</a>
       </div>
     </aside>
 
@@ -3723,28 +3820,35 @@ body.sb-collapsed .sidebar *{
             <div class="d-flex justify-content-between align-items-center">
 
               <div>
-                <h5 class="mb-1">Biểu đồ góc khớp theo thời gian</h5>
-                <div class="text-muted small">Phiên đo gần nhất.</div>
+                <h5 class="mb-1" data-i18n="charts.title">Biểu đồ góc khớp theo thời gian</h5>
+                <div class="text-muted small" data-i18n="charts.subtitle">Phiên đo gần nhất.</div>
 
                 {% if exercise_name %}
-                <div class="text-muted small">Bài tập: <strong>{{ exercise_name }}</strong></div>
+                <div class="text-muted small">
+                  <span data-i18n="charts.exercise">Bài tập:</span>
+                  <strong> {{ exercise_name }}</strong>
+                </div>
                 {% endif %}
 
                 {% if patient_code %}
-                <div class="text-muted small">Mã bệnh nhân: <strong>{{ patient_code }}</strong></div>
+                <div class="text-muted small">
+                  <span data-i18n="charts.patient_code">Mã bệnh nhân:</span>
+                  <strong>{{ patient_code }}</strong>
+                </div>
                 {% endif %}
               </div>
 
               <div class="d-flex gap-2">
                 <a class="btn btn-outline-success btn-sm"
                    href="/session/export_csv{% if patient_code %}?patient_code={{ patient_code }}{% endif %}"
-                   target="_blank">
+                   target="_blank"
+                   data-i18n="charts.save_csv">
                   Lưu CSV
                 </a>
 
-                <a class="btn btn-outline-primary btn-sm" href="/charts_emg">EMG</a>
+                <a class="btn btn-outline-primary btn-sm" href="/charts_emg" data-i18n="charts.emg">EMG</a>
 
-                <button id="btnNextEx" class="btn btn-primary btn-sm">
+                <button id="btnNextEx" class="btn btn-primary btn-sm" data-i18n="charts.next_ex">
                   Bài tập tiếp theo
                 </button>
               </div>
@@ -3752,17 +3856,17 @@ body.sb-collapsed .sidebar *{
             </div>
           </div>
 
-          <div class="panel"><h6>Hip (độ)</h6><div class="chart-box"><canvas id="hipChart"></canvas></div></div>
-          <div class="panel"><h6>Knee (độ)</h6><div class="chart-box"><canvas id="kneeChart"></canvas></div></div>
-          <div class="panel"><h6>Ankle (độ)</h6><div class="chart-box"><canvas id="ankleChart"></canvas></div></div>
+          <div class="panel"><h6 data-i18n="charts.hip">Hip (độ)</h6><div class="chart-box"><canvas id="hipChart"></canvas></div></div>
+          <div class="panel"><h6 data-i18n="charts.knee">Knee (độ)</h6><div class="chart-box"><canvas id="kneeChart"></canvas></div></div>
+          <div class="panel"><h6 data-i18n="charts.ankle">Ankle (độ)</h6><div class="chart-box"><canvas id="ankleChart"></canvas></div></div>
         </div>
 
         <div class="col-lg-3">
 
           <!-- 🟦 VAS PANEL -->
           <div class="panel mb-3">
-            <div class="eval-header mb-1">Đau chủ quan (VAS)</div>
-            <div class="eval-subtitle mb-2 small">
+            <div class="eval-header mb-1" data-i18n="charts.vas_title">Đau chủ quan (VAS)</div>
+            <div class="eval-subtitle mb-2 small" data-i18n="charts.vas_sub">
               Mức đau trước và sau bài tập hiện tại (0–10).
             </div>
 
@@ -3770,24 +3874,24 @@ body.sb-collapsed .sidebar *{
               <table class="table table-sm mb-2">
                 <tbody>
                   <tr>
-                    <th scope="row" style="width:45%;">Trước khi tập</th>
+                    <th scope="row" style="width:45%;" data-i18n="charts.vas_before">Trước khi tập</th>
                     <td class="text-end">
                       {% if vas_before is not none %}
                         <span class="vas-mini-value">{{ '%.1f'|format(vas_before) }}</span>
                         <span class="vas-mini-label">/ 10</span>
                       {% else %}
-                        <span class="text-muted small">Chưa ghi nhận</span>
+                        <span class="text-muted small" data-i18n="charts.vas_none">Chưa ghi nhận</span>
                       {% endif %}
                     </td>
                   </tr>
                   <tr>
-                    <th scope="row">Sau khi tập</th>
+                    <th scope="row" data-i18n="charts.vas_after">Sau khi tập</th>
                     <td class="text-end">
                       {% if vas_after is not none %}
                         <span class="vas-mini-value">{{ '%.1f'|format(vas_after) }}</span>
                         <span class="vas-mini-label">/ 10</span>
                       {% else %}
-                        <span class="text-muted small">Chưa ghi nhận</span>
+                        <span class="text-muted small" data-i18n="charts.vas_none">Chưa ghi nhận</span>
                       {% endif %}
                     </td>
                   </tr>
@@ -3798,23 +3902,23 @@ body.sb-collapsed .sidebar *{
                 {% set diff = vas_after - vas_before %}
                 <div class="small mt-1">
                   {% if diff > 0 %}
-                    <span class="badge bg-danger me-1">Đau tăng</span>
-                    <span class="text-muted">Tăng khoảng {{ '%.1f'|format(diff) }} điểm sau bài tập.</span>
+                    <span class="badge bg-danger me-1" data-i18n="charts.vas_more">Đau tăng</span>
+                    <span class="text-muted" data-i18n="charts.vas_more_desc">Tăng khoảng {{ '%.1f'|format(diff) }} điểm sau bài tập.</span>
                   {% elif diff < 0 %}
-                    <span class="badge bg-success me-1">Đau giảm</span>
-                    <span class="text-muted">Giảm khoảng {{ '%.1f'|format(-diff) }} điểm sau bài tập.</span>
+                    <span class="badge bg-success me-1" data-i18n="charts.vas_less">Đau giảm</span>
+                    <span class="text-muted" data-i18n="charts.vas_less_desc">Giảm khoảng {{ '%.1f'|format(-diff) }} điểm sau bài tập.</span>
                   {% else %}
-                    <span class="badge bg-secondary me-1">Không đổi</span>
-                    <span class="text-muted">Mức đau không thay đổi sau bài tập.</span>
+                    <span class="badge bg-secondary me-1" data-i18n="charts.vas_same">Không đổi</span>
+                    <span class="text-muted" data-i18n="charts.vas_same_desc">Mức đau không thay đổi sau bài tập.</span>
                   {% endif %}
                 </div>
               {% else %}
-                <div class="small text-muted mt-1">
+                <div class="small text-muted mt-1" data-i18n="charts.vas_not_enough">
                   Chưa đủ dữ liệu VAS trước/sau cho bài này.
                 </div>
               {% endif %}
             {% else %}
-              <div class="small text-muted">
+              <div class="small text-muted" data-i18n="charts.vas_no_data">
                 Chưa ghi nhận VAS cho bài tập hiện tại.
               </div>
             {% endif %}
@@ -3822,35 +3926,35 @@ body.sb-collapsed .sidebar *{
 
           <!-- FMA -->
           <div class="eval-panel mb-3">
-            <div class="eval-header mb-1">Đánh giá FMA</div>
+            <div class="eval-header mb-1" data-i18n="charts.fma_title">Đánh giá FMA</div>
 
             <div id="evalContent">
               <div class="d-flex align-items-center justify-content-center py-4">
                 <div class="spinner-border text-primary me-2"></div>
-                <span class="small text-muted">Đang xử lý...</span>
+                <span class="small text-muted" data-i18n="charts.loading">Đang xử lý...</span>
               </div>
             </div>
 
             <hr class="my-2">
 
             <div id="totalBox" class="small mb-2">
-              <span class="me-1 fw-semibold">Điểm bài hiện tại:</span>
+              <span class="me-1 fw-semibold" data-i18n="charts.current_score">Điểm bài hiện tại:</span>
               <span id="totalScore" class="badge bg-primary ms-1">0 / 2</span>
             </div>
 
             <hr class="my-2">
-            <div class="small fw-bold mb-1">Tổng kết các bài đã đo</div>
+            <div class="small fw-bold mb-1" data-i18n="charts.all_ex_summary">Tổng kết các bài đã đo</div>
             <div id="allExercisesSummary" class="small"></div>
 
           </div>
 
           <!-- Bảng EMG -->
           <div class="panel">
-            <div class="eval-header mb-1">Tín hiệu điện cơ EMG</div>
+            <div class="eval-header mb-1" data-i18n="charts.emg_title">Tín hiệu điện cơ EMG</div>
             <table class="table table-sm mb-0">
               <tbody>
                 <tr>
-                  <th scope="row">Cơ đùi</th>
+                  <th scope="row" data-i18n="charts.emg_thigh">Cơ đùi</th>
                   <td class="text-end">
                     <span style="
                         background:#dcfce7;
@@ -3859,11 +3963,11 @@ body.sb-collapsed .sidebar *{
                         border-radius:8px;
                         font-weight:600;
                         font-size:0.85rem;
-                    ">Khỏe</span>
+                    " data-i18n="charts.emg_good">Khỏe</span>
                   </td>
                 </tr>
                 <tr>
-                  <th scope="row">Cơ cẳng chân</th>
+                  <th scope="row" data-i18n="charts.emg_shank">Cơ cẳng chân</th>
                   <td class="text-end text-muted">—</td>
                 </tr>
               </tbody>
@@ -3879,8 +3983,159 @@ body.sb-collapsed .sidebar *{
 </div>
 
 <script>
+// ======= I18N chung cho trang biểu đồ =======
+const I18N = {
+  vi: {
+    "menu.title":"MENU",
+    "menu.home":"Trang chủ",
+    "menu.calib":"Hiệu chuẩn",
+    "menu.patinfo":"Thông tin bệnh nhân",
+    "menu.record":"Bệnh án",
+    "menu.charts":"Biểu đồ",
+    "menu.settings":"Cài đặt",
+
+    "charts.title":"Biểu đồ góc khớp theo thời gian",
+    "charts.subtitle":"Phiên đo gần nhất.",
+    "charts.exercise":"Bài tập:",
+    "charts.patient_code":"Mã bệnh nhân:",
+    "charts.save_csv":"Lưu CSV",
+    "charts.emg":"EMG",
+    "charts.next_ex":"Bài tập tiếp theo",
+    "charts.hip":"Hip (độ)",
+    "charts.knee":"Knee (độ)",
+    "charts.ankle":"Ankle (độ)",
+
+    "charts.vas_title":"Đau chủ quan (VAS)",
+    "charts.vas_sub":"Mức đau trước và sau bài tập hiện tại (0–10).",
+    "charts.vas_before":"Trước khi tập",
+    "charts.vas_after":"Sau khi tập",
+    "charts.vas_none":"Chưa ghi nhận",
+    "charts.vas_more":"Đau tăng",
+    "charts.vas_more_desc":"Tăng khoảng ... điểm sau bài tập.",
+    "charts.vas_less":"Đau giảm",
+    "charts.vas_less_desc":"Giảm khoảng ... điểm sau bài tập.",
+    "charts.vas_same":"Không đổi",
+    "charts.vas_same_desc":"Mức đau không thay đổi sau bài tập.",
+    "charts.vas_not_enough":"Chưa đủ dữ liệu VAS trước/sau cho bài này.",
+    "charts.vas_no_data":"Chưa ghi nhận VAS cho bài tập hiện tại.",
+
+    "charts.fma_title":"Đánh giá FMA",
+    "charts.loading":"Đang xử lý...",
+    "charts.current_score":"Điểm bài hiện tại:",
+    "charts.all_ex_summary":"Tổng kết các bài đã đo",
+
+    "charts.emg_title":"Tín hiệu điện cơ EMG",
+    "charts.emg_thigh":"Cơ đùi",
+    "charts.emg_good":"Khỏe",
+    "charts.emg_shank":"Cơ cẳng chân"
+  },
+  en: {
+    "menu.title":"MENU",
+    "menu.home":"Home",
+    "menu.calib":"Calibration",
+    "menu.patinfo":"Patient info",
+    "menu.record":"Records",
+    "menu.charts":"Charts",
+    "menu.settings":"Settings",
+
+    "charts.title":"Joint angle chart over time",
+    "charts.subtitle":"Most recent session.",
+    "charts.exercise":"Exercise:",
+    "charts.patient_code":"Patient code:",
+    "charts.save_csv":"Save CSV",
+    "charts.emg":"EMG",
+    "charts.next_ex":"Next exercise",
+    "charts.hip":"Hip (deg)",
+    "charts.knee":"Knee (deg)",
+    "charts.ankle":"Ankle (deg)",
+
+    "charts.vas_title":"Subjective pain (VAS)",
+    "charts.vas_sub":"Pain level before and after current exercise (0–10).",
+    "charts.vas_before":"Before exercise",
+    "charts.vas_after":"After exercise",
+    "charts.vas_none":"No data",
+    "charts.vas_more":"Pain increased",
+    "charts.vas_more_desc":"Increased pain after exercise.",
+    "charts.vas_less":"Pain decreased",
+    "charts.vas_less_desc":"Decreased pain after exercise.",
+    "charts.vas_same":"No change",
+    "charts.vas_same_desc":"Pain level unchanged.",
+    "charts.vas_not_enough":"Not enough VAS data for this exercise.",
+    "charts.vas_no_data":"No VAS data recorded.",
+
+    "charts.fma_title":"FMA evaluation",
+    "charts.loading":"Processing...",
+    "charts.current_score":"Score of this exercise:",
+    "charts.all_ex_summary":"Summary of all exercises",
+
+    "charts.emg_title":"EMG signal",
+    "charts.emg_thigh":"Thigh muscle",
+    "charts.emg_good":"Strong",
+    "charts.emg_shank":"Shank muscle"
+  }
+};
+
+function applyLanguage(lang){
+  const dict = I18N[lang] || I18N.vi;
+  document.querySelectorAll("[data-i18n]").forEach(el=>{
+    const key = el.getAttribute("data-i18n");
+    if (dict[key]) el.textContent = dict[key];
+  });
+  document.querySelectorAll("[data-i18n-placeholder]").forEach(el=>{
+    const key = el.getAttribute("data-i18n-placeholder");
+    if (dict[key]) el.placeholder = dict[key];
+  });
+}
+
+document.addEventListener("DOMContentLoaded", ()=>{
+  const lang = localStorage.getItem("appLang") || "vi";
+  applyLanguage(lang);
+});
+</script>
+
+<script>
 document.getElementById("btnToggleSB").onclick = () =>
   document.body.classList.toggle("sb-collapsed");
+
+// Ngôn ngữ hiện tại
+const CURRENT_LANG = localStorage.getItem("appLang") || "vi";
+
+// Các câu text động dùng trong JS
+const TEXT = {
+  vi: {
+    no_ex_name   : "Chưa có tên bài tập.",
+    no_rom       : "Không có dữ liệu ROM cho bài hiện tại.",
+    no_ex_saved  : "Chưa có bài nào được lưu.",
+    total_all    : "Tổng điểm các bài đã đo:",
+    finished_all : "Đã hoàn thành các bài tập. Hệ thống sẽ quay lại trang đo."
+  },
+  en: {
+    no_ex_name   : "No exercise name.",
+    no_rom       : "No ROM data for the current exercise.",
+    no_ex_saved  : "No exercise has been saved yet.",
+    total_all    : "Total score of all exercises:",
+    finished_all : "All exercises are completed. System will go back to measurement page."
+  }
+};
+
+const STRENGTH_TEXT = {
+  vi: {
+    good_label : "Tốt",
+    good_desc  : "Biên độ vận động lớn, kiểm soát động tác tốt.",
+    mid_label  : "Trung bình",
+    mid_desc   : "Biên độ vận động ở mức chấp nhận được, nên tiếp tục tập để cải thiện.",
+    weak_label : "Yếu",
+    weak_desc  : "Biên độ vận động còn hạn chế, cần tăng cường tập luyện và theo dõi."
+  },
+  en: {
+    good_label : "Good",
+    good_desc  : "Large range of motion with good control.",
+    mid_label  : "Moderate",
+    mid_desc   : "Acceptable range of motion, further training is recommended.",
+    weak_label : "Weak",
+    weak_desc  : "Limited range of motion, needs more training and follow-up."
+  }
+};
 
 // Dữ liệu từ server (thô)
 const t_ms_raw    = {{ t_ms|tojson }};
@@ -3947,26 +4202,28 @@ function fmaScore(rom){
   return 0;
 }
 
-// Chuyển điểm FMA -> nhận xét cơ gối
+// Chuyển điểm FMA -> nhận xét cơ gối, đa ngôn ngữ
 function strengthInfo(score){
   score = Number(score) || 0;
+  const T = STRENGTH_TEXT[CURRENT_LANG] || STRENGTH_TEXT.vi;
+
   if (score >= 2){
     return {
-      label: "Tốt",
-      desc:  "Biên độ vận động lớn, kiểm soát động tác tốt.",
+      label: T.good_label,
+      desc : T.good_desc,
       badgeClass: "bg-success"
     };
   }
   if (score === 1){
     return {
-      label: "Trung bình",
-      desc:  "Biên độ vận động ở mức chấp nhận được, nên tiếp tục tập để cải thiện.",
+      label: T.mid_label,
+      desc : T.mid_desc,
       badgeClass: "bg-warning text-dark"
     };
   }
   return {
-    label: "Yếu",
-    desc:  "Biên độ vận động còn hạn chế, cần tăng cường tập luyện và theo dõi.",
+    label: T.weak_label,
+    desc : T.weak_desc,
     badgeClass: "bg-danger"
   };
 }
@@ -3983,8 +4240,10 @@ const defaultOrder = ["ankle flexion","knee flexion","hip flexion"];
 const exerciseOrder = Array.from(new Set([...defaultOrder, ...Object.keys(storedScores)]));
 
 function showCurrentExerciseScore(){
+  const T = TEXT[CURRENT_LANG] || TEXT.vi;
+
   if (!currentExerciseName){
-    evalBox.innerHTML = "<div class='text-muted'>Chưa có tên bài tập.</div>";
+    evalBox.innerHTML = `<div class='text-muted'>${T.no_ex_name}</div>`;
     totalScoreSpan.textContent = "0 / 2";
     return;
   }
@@ -3993,7 +4252,7 @@ function showCurrentExerciseScore(){
 
   if (!data){
     if (!kneeArr.length){
-      evalBox.innerHTML = "<div class='text-muted'>Không có dữ liệu ROM cho bài hiện tại.</div>";
+      evalBox.innerHTML = `<div class='text-muted'>${T.no_rom}</div>`;
       totalScoreSpan.textContent = "0 / 2";
       return;
     }
@@ -4050,11 +4309,12 @@ function showCurrentExerciseScore(){
 const allSummaryDiv = document.getElementById("allExercisesSummary");
 
 function renderAllExercisesSummary(){
+  const T = TEXT[CURRENT_LANG] || TEXT.vi;
   if (!allSummaryDiv) return;
 
   const keys = Object.keys(storedScores);
   if (!keys.length){
-    allSummaryDiv.innerHTML = "<div class='text-muted'>Chưa có bài nào được lưu.</div>";
+    allSummaryDiv.innerHTML = `<div class='text-muted'>${T.no_ex_saved}</div>`;
     return;
   }
 
@@ -4095,7 +4355,7 @@ function renderAllExercisesSummary(){
 
   html += `
     <div class='total-summary'>
-      Tổng điểm các bài đã đo:
+      ${T.total_all}
       <span>${total} / ${sortedNames.length * 2}</span>
     </div>
   `;
@@ -4109,6 +4369,7 @@ renderAllExercisesSummary();
 const btnNext = document.getElementById("btnNextEx");
 
 btnNext.onclick = () => {
+  const T = TEXT[CURRENT_LANG] || TEXT.vi;
   const idx = exerciseOrder.indexOf(currentExerciseName);
 
   if (idx >= 0 && idx < exerciseOrder.length - 1){
@@ -4127,11 +4388,10 @@ btnNext.onclick = () => {
   if (patientCode) {
     url += "?patient_code=" + encodeURIComponent(patientCode);
   }
-  alert("Đã hoàn thành các bài tập. Hệ thống sẽ quay lại trang đo.");
+  alert(T.finished_all);
   window.location.href = url;
 };
 </script>
-
 </body>
 </html>
 """
@@ -4235,13 +4495,13 @@ body.sb-collapsed .sidebar *{
   <div class="layout">
     <aside class="sidebar-col">
       <div class="sidebar">
-        <div class="mb-2 fw-bold">MENU</div>
-        <a class="menu-btn" href="/">Trang chủ</a>
-        <a class="menu-btn" href="/calibration">Hiệu chuẩn</a>
-        <a class="menu-btn" href="/patients/manage">Thông tin bệnh nhân</a>
-        <a class="menu-btn" href="/charts">Biểu đồ góc</a>
-        <a class="menu-btn active" href="/charts_emg">Biểu đồ EMG</a>
-        <a class="menu-btn" href="/settings">Cài đặt</a>
+        <div class="mb-2 fw-bold" data-i18n="menu.title">MENU</div>
+        <a class="menu-btn" href="/"                 data-i18n="menu.home">Trang chủ</a>
+        <a class="menu-btn" href="/calibration"      data-i18n="menu.calib">Hiệu chuẩn</a>
+        <a class="menu-btn" href="/patients/manage"  data-i18n="menu.patinfo">Thông tin bệnh nhân</a>
+        <a class="menu-btn" href="/charts"           data-i18n="menu.charts">Biểu đồ</a>
+        <a class="menu-btn active" href="/charts_emg"data-i18n="menu.emg">Biểu đồ EMG</a>
+        <a class="menu-btn" href="/settings"         data-i18n="menu.settings">Cài đặt</a>
       </div>
     </aside>
 
@@ -4249,12 +4509,12 @@ body.sb-collapsed .sidebar *{
       <div class="panel">
         <div class="d-flex justify-content-between align-items-center">
           <div>
-            <h5>Biểu đồ tín hiệu EMG</h5>
-            <div class="text-muted small">
+            <h5 data-i18n="emg.title">Biểu đồ tín hiệu EMG</h5>
+            <div class="text-muted small" data-i18n="emg.subtitle">
               Biên độ EMG theo thời gian (mV). Dùng cùng thời gian với phiên đo gần nhất.
             </div>
           </div>
-          <a class="btn btn-outline-primary btn-sm" href="/charts">← Biểu đồ góc khớp</a>
+          <a class="btn btn-outline-primary btn-sm" href="/charts" data-i18n="emg.back">← Biểu đồ góc khớp</a>
         </div>
       </div>
 
@@ -4268,6 +4528,45 @@ body.sb-collapsed .sidebar *{
 </div>
 
 <script>
+// I18N cho trang EMG
+const I18N_EMG = {
+  vi:{
+    "menu.title":"MENU",
+    "menu.home":"Trang chủ",
+    "menu.calib":"Hiệu chuẩn",
+    "menu.patinfo":"Thông tin bệnh nhân",
+    "menu.charts":"Biểu đồ",
+    "menu.emg":"Biểu đồ EMG",
+    "menu.settings":"Cài đặt",
+    "emg.title":"Biểu đồ tín hiệu EMG",
+    "emg.subtitle":"Biên độ EMG theo thời gian (mV). Dùng cùng thời gian với phiên đo gần nhất.",
+    "emg.back":"← Biểu đồ góc khớp"
+  },
+  en:{
+    "menu.title":"MENU",
+    "menu.home":"Home",
+    "menu.calib":"Calibration",
+    "menu.patinfo":"Patient info",
+    "menu.charts":"Angle charts",
+    "menu.emg":"EMG charts",
+    "menu.settings":"Settings",
+    "emg.title":"EMG signal chart",
+    "emg.subtitle":"EMG amplitude over time (mV), aligned with last measurement session.",
+    "emg.back":"← Joint angle charts"
+  }
+};
+function applyLangEmg(lang){
+  const dict = I18N_EMG[lang] || I18N_EMG.vi;
+  document.querySelectorAll("[data-i18n]").forEach(el=>{
+    const k = el.getAttribute("data-i18n");
+    if (dict[k]) el.textContent = dict[k];
+  });
+}
+document.addEventListener("DOMContentLoaded", ()=>{
+  const lang = localStorage.getItem("appLang") || "vi";
+  applyLangEmg(lang);
+});
+
 document.getElementById("btnToggleSB").onclick = () =>
   document.body.classList.toggle("sb-collapsed");
 
@@ -4299,7 +4598,6 @@ new Chart(document.getElementById("emgChart"), {
 """
 
 # ===================== Patients Manage =====================
-# ======= Patients Manage (sidebar thu gọn kiểu hiệu chuẩn) =======
 PATIENTS_MANAGE_HTML = """
 <!doctype html><html lang="vi"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -4359,7 +4657,7 @@ body{ background:#e8f3ff; }
 <nav class="navbar bg-white shadow-sm px-3">
   <div class="container-fluid d-flex align-items-center">
     <button id="btnToggleSB" class="btn me-2">☰</button>
-    <span class="navbar-brand mb-0">Thông tin bệnh nhân</span>
+    <span class="navbar-brand mb-0" data-i18n="patients.manage_title">Thông tin bệnh nhân</span>
     <div class="ms-auto d-flex align-items-center gap-2">
       <img src="{{ url_for('static', filename='unnamed.png') }}" alt="Logo" height="40">
     </div>
@@ -4371,13 +4669,13 @@ body{ background:#e8f3ff; }
     <!-- Sidebar -->
     <aside class="sidebar-col">
       <div class="sidebar">
-        <div class="mb-2 fw-bold">MENU</div>
-        <a class="menu-btn" href="/">Trang chủ</a>
-        <a class="menu-btn" href="/calibration">Hiệu chuẩn</a>
-        <a class="menu-btn active" href="/patients/manage">Thông tin bệnh nhân</a>
-        <a class="menu-btn" href="/records">Bệnh án</a>
-        <a class="menu-btn" href="/charts">Biểu đồ</a>
-        <a class="menu-btn" href="/settings">Cài đặt</a>
+        <div class="mb-2 fw-bold" data-i18n="menu.title">MENU</div>
+        <a class="menu-btn" href="/"                 data-i18n="menu.home">Trang chủ</a>
+        <a class="menu-btn" href="/calibration"      data-i18n="menu.calib">Hiệu chuẩn</a>
+        <a class="menu-btn active" href="/patients/manage" data-i18n="menu.patinfo">Thông tin bệnh nhân</a>
+        <a class="menu-btn" href="/records"          data-i18n="menu.record">Bệnh án</a>
+        <a class="menu-btn" href="/charts"           data-i18n="menu.charts">Biểu đồ</a>
+        <a class="menu-btn" href="/settings"         data-i18n="menu.settings">Cài đặt</a>
       </div>
     </aside>
 
@@ -4389,19 +4687,19 @@ body{ background:#e8f3ff; }
           <div class="card p-3">
             <div class="row g-3">
               <div class="col-12">
-                <label class="form-label">Họ và tên</label>
+                <label class="form-label" data-i18n="patients.name">Họ và tên</label>
                 <input id="name" class="form-control input-sm">
               </div>
               <div class="col-12">
-                <label class="form-label">CCCD</label>
+                <label class="form-label" data-i18n="patients.id">CCCD</label>
                 <input id="national_id" class="form-control input-sm">
               </div>
               <div class="col-6">
-                <label class="form-label">Ngày sinh</label>
+                <label class="form-label" data-i18n="patients.dob">Ngày sinh</label>
                 <input id="dob" class="form-control input-sm" placeholder="vd 30/05/2001 hoặc 2001-05-30">
               </div>
               <div class="col-6">
-                <label class="form-label">Giới tính</label>
+                <label class="form-label" data-i18n="patients.gender">Giới tính</label>
                 <select id="gender" class="form-select input-sm">
                   <option value="">--</option>
                   <option>Male</option>
@@ -4409,46 +4707,46 @@ body{ background:#e8f3ff; }
                 </select>
               </div>
               <div class="col-6">
-                <label class="form-label">Chiều cao (cm)</label>
+                <label class="form-label" data-i18n="patients.height">Chiều cao (cm)</label>
                 <input id="height" class="form-control input-sm">
               </div>
               <input type="hidden" id="pat_code">
               <div class="col-6">
-                <label class="form-label">Cân nặng (kg)</label>
+                <label class="form-label" data-i18n="patients.weight">Cân nặng (kg)</label>
                 <input id="weight" class="form-control input-sm">
               </div>
 
               <div class="col-12">
-                <label class="form-label">Mã bệnh nhân</label>
+                <label class="form-label" data-i18n="patients.code">Mã bệnh nhân</label>
                 <input id="patient_code" class="form-control input-sm" placeholder="(để trống để tạo mới)">
               </div>
 
               <div class="col-12 d-flex justify-content-center gap-4 mt-2">
-                <button id="btnSave" class="btn btn-outline-thick py-2 px-5 fs-5">Lưu</button>
-                <button id="btnDelete" class="btn btn-outline-thick py-2 px-5 fs-5">Xóa</button>
+                <button id="btnSave" class="btn btn-outline-thick py-2 px-5 fs-5" data-i18n="patients.save">Lưu</button>
+                <button id="btnDelete" class="btn btn-outline-thick py-2 px-5 fs-5" data-i18n="patients.delete">Xóa</button>
               </div>
             </div>
           </div>
 
           <div class="card p-3 mt-3">
-            <button id="btnClearAll" class="btn btn-outline-danger w-100">Xóa toàn bộ danh sách</button>
+            <button id="btnClearAll" class="btn btn-outline-danger w-100" data-i18n="patients.clear_all">Xóa toàn bộ danh sách</button>
           </div>
         </div>
 
         <!-- Bảng phải -->
         <div class="col-lg-7">
           <div class="card p-3">
-            <input id="q" class="form-control mb-3" placeholder="Tìm kiếm...">
+            <input id="q" class="form-control mb-3" placeholder="Tìm kiếm..." data-i18n-placeholder="patients.search">
             <div class="table-responsive">
               <table class="table table-hover align-middle" id="tbl">
                 <thead>
                   <tr>
                     <th style="width:60px">#</th>
-                    <th>Mã bệnh nhân</th>
-                    <th>Họ và tên</th>
-                    <th>CCCD</th>
-                    <th>Ngày sinh</th>
-                    <th>Giới tính</th>
+                    <th data-i18n="patients.th_code">Mã bệnh nhân</th>
+                    <th data-i18n="patients.th_name">Họ và tên</th>
+                    <th data-i18n="patients.th_id">CCCD</th>
+                    <th data-i18n="patients.th_dob">Ngày sinh</th>
+                    <th data-i18n="patients.th_gender">Giới tính</th>
                   </tr>
                 </thead>
                 <tbody></tbody>
@@ -4462,6 +4760,75 @@ body{ background:#e8f3ff; }
 </div>
 
 <script>
+// I18N cho trang quản lý bệnh nhân
+const I18N_PAT = {
+  vi:{
+    "menu.title":"MENU",
+    "menu.home":"Trang chủ",
+    "menu.calib":"Hiệu chuẩn",
+    "menu.patinfo":"Thông tin bệnh nhân",
+    "menu.record":"Bệnh án",
+    "menu.charts":"Biểu đồ",
+    "menu.settings":"Cài đặt",
+
+    "patients.manage_title":"Thông tin bệnh nhân",
+    "patients.name":"Họ và tên",
+    "patients.id":"CCCD",
+    "patients.dob":"Ngày sinh",
+    "patients.gender":"Giới tính",
+    "patients.height":"Chiều cao (cm)",
+    "patients.weight":"Cân nặng (kg)",
+    "patients.code":"Mã bệnh nhân",
+    "patients.save":"Lưu",
+    "patients.delete":"Xóa",
+    "patients.clear_all":"Xóa toàn bộ danh sách",
+    "patients.search":"Tìm kiếm...",
+    "patients.th_code":"Mã bệnh nhân",
+    "patients.th_name":"Họ và tên",
+    "patients.th_id":"CCCD",
+    "patients.th_dob":"Ngày sinh",
+    "patients.th_gender":"Giới tính"
+  },
+  en:{
+    "menu.title":"MENU",
+    "menu.home":"Home",
+    "menu.calib":"Calibration",
+    "menu.patinfo":"Patient info",
+    "menu.record":"Records",
+    "menu.charts":"Charts",
+    "menu.settings":"Settings",
+
+    "patients.manage_title":"Patient information",
+    "patients.name":"Full name",
+    "patients.id":"National ID",
+    "patients.dob":"Date of birth",
+    "patients.gender":"Gender",
+    "patients.height":"Height (cm)",
+    "patients.weight":"Weight (kg)",
+    "patients.code":"Patient code",
+    "patients.save":"Save",
+    "patients.delete":"Delete",
+    "patients.clear_all":"Delete all",
+    "patients.search":"Search...",
+    "patients.th_code":"Patient code",
+    "patients.th_name":"Full name",
+    "patients.th_id":"ID",
+    "patients.th_dob":"Date of birth",
+    "patients.th_gender":"Gender"
+  }
+};
+function applyLangPatients(lang){
+  const dict = I18N_PAT[lang] || I18N_PAT.vi;
+  document.querySelectorAll("[data-i18n]").forEach(el=>{
+    const k = el.getAttribute("data-i18n");
+    if (dict[k]) el.textContent = dict[k];
+  });
+  document.querySelectorAll("[data-i18n-placeholder]").forEach(el=>{
+    const k = el.getAttribute("data-i18n-placeholder");
+    if (dict[k]) el.placeholder = dict[k];
+  });
+}
+
 // Toggle sidebar: giống các trang khác
 document.getElementById('btnToggleSB').addEventListener('click', ()=>{
   document.body.classList.toggle('sb-collapsed');
@@ -4548,10 +4915,15 @@ $('btnClearAll').onclick = ()=>{
     });
 };
 loadAll();
+
+// áp dụng ngôn ngữ sau khi DOM sẵn sàng
+document.addEventListener("DOMContentLoaded", ()=>{
+  const lang = localStorage.getItem("appLang") || "vi";
+  applyLangPatients(lang);
+});
 </script>
 </body></html>
 """
-
 
 
 
