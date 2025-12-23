@@ -1,54 +1,133 @@
+
 # webgiaodien.py
-import os, json, time
+import os, json, time, math, io, csv, threading
 from datetime import datetime, timezone, timedelta
-import threading
-from collections import defaultdict
-import io, csv
-from flask import send_file  # thêm import này
-from flask import request, jsonify, render_template_string, session
 from uuid import uuid4
+from collections import defaultdict, deque
+
+from flask import Flask, request, jsonify, render_template_string, redirect, url_for, flash, send_file
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+from werkzeug.security import generate_password_hash, check_password_hash
+
+from flask_socketio import SocketIO, emit
+
+# =========================
+#   GLOBALS / CONSTANTS
+# =========================
+VN_TZ = timezone(timedelta(hours=7))
+
+DATA_LOCK = threading.Lock()
+MAX_LOCK  = threading.Lock()
+EMG_LOCK  = threading.Lock()
+VAS_LOCK  = threading.Lock()
+RECORD_LOCK = threading.Lock()
+
+data_buffer = []          # samples đang đo
+LAST_SESSION = []         # samples phiên gần nhất
+
+MAX_ANGLES = {"hip": 0.0, "knee": 0.0, "ankle": 0.0}
+
+EMG_BUF = deque(maxlen=200)     # RMS window ~200 mẫu
+EMG_ENV = 0.0
+EMG_ALPHA = 0.1
+
+LAST_EMG = {"emg": None}        # giữ EMG gần nhất (object {v,t_ms,sender_id})
+
 VAS_STORE = []
 VAS_FILE  = "vas.json"
-VN_TZ = timezone(timedelta(hours=7))
-VAS_LOCK  = threading.Lock()
-MAX_LOCK    = threading.Lock()
-MAX_ANGLES = {"hip": 0.0, "knee": 0.0, "ankle": 0.0}
-MEDICAL_RECORDS = []           # danh sách bệnh án
-RECORD_LOCK    = threading.Lock()
-RECORD_FILE    = "records.json"
+
 RECORD_STORE = []
-data_buffer = []  # bộ đệm mẫu đo
-LAST_SESSION = []
-DATA_LOCK = threading.Lock()
+RECORD_FILE  = "records.json"
 
-# Bật/tắt đọc cổng COM khi chạy local
-SERIAL_ENABLED = True  # ép bật serial
+PATIENTS_FILE = "sample.json"
+EXPORT_DIR = "exports"
+os.makedirs(EXPORT_DIR, exist_ok=True)
 
-# ==== STATE & NGƯỠNG CHO HIP DÙNG PITCH2 ====
-HIP_STATE    = {"mode": "front", "prev_pitch2": 0.0}  # mode: 'front' hoặc 'back'
-PITCH_MID    = 90.0    # pitch2 ~ 90° là “biên” giữa trước / sau
-PITCH_HYS    = 10.0    # hysteresis: <80° chắc chắn là front, >100° chắc chắn là back
-HIP_CROSS_TH = 40.0    # chỉ đổi mode khi |hip thô| < 40°
-DEADZONE     = 2.0     # |hip| < 2° coi như 0 cho mượt
-# ============================================
+# ========== SERIAL ==========
+SERIAL_ENABLED = True
+
+pyserial = None
+list_ports = None
+try:
+    import serial as pyserial
+    from serial.tools import list_ports
+except Exception:
+    SERIAL_ENABLED = False
+
+ser = None
+serial_thread = None
+stop_serial_thread = False
+
+
+# =========================
+#   SIMPLE HTML PLACEHOLDER
+#   (Bạn thay DASH_HTML bằng bản của bạn)
+# =========================
+LOGIN_HTML = """<!doctype html><html><body>
+<h3>Login</h3>
+<form method="post">
+<input name="username" placeholder="user"><br>
+<input name="password" type="password" placeholder="pass"><br>
+<button>Login</button>
+</form>
+{% if error_message %}<p style="color:red">{{error_message}}</p>{% endif %}
+</body></html>"""
+
+# ⚠️ Bạn đang có DASH_HTML rất dài — giữ nguyên bản bạn đang dùng.
+# Ở đây chỉ placeholder để file chạy được.
+DASH_HTML = """<!doctype html><html><body>
+<h3>Dashboard placeholder</h3>
+<p>Xin chào, {{username}}</p>
+<p>Hãy thay DASH_HTML trong file này bằng bản UI của bạn.</p>
+</body></html>"""
+
+CHARTS_HTML = """<!doctype html><html><body>
+<h3>Charts placeholder</h3>
+<p>exercise={{exercise_name}} patient={{patient_code}}</p>
+</body></html>"""
+
+CALIBRATION_HTML = """<!doctype html><html><body><h3>Calibration</h3></body></html>"""
+PATIENT_NEW_HTML = """<!doctype html><html><body><h3>Patients</h3></body></html>"""
+PATIENTS_MANAGE_HTML = """<!doctype html><html><body><h3>Manage Patients</h3></body></html>"""
+RECORD_HTML = """<!doctype html><html><body><h3>Records</h3></body></html>"""
+SETTINGS_HTML = """<!doctype html><html><body><h3>Settings</h3></body></html>"""
+EMG_CHART_HTML = """<!doctype html><html><body><h3>EMG Charts</h3></body></html>"""
+
+
+# =========================
+#   HELPERS
+# =========================
+def _ensure_patients_file():
+    if not os.path.exists(PATIENTS_FILE):
+        with open(PATIENTS_FILE, "w", encoding="utf-8") as f:
+            json.dump({}, f, ensure_ascii=False, indent=2)
+
+def gen_patient_code(full_name: str) -> str:
+    last = (full_name.split()[-1] if full_name else "BN")
+    base = "".join(ch for ch in last if ch.isalnum())
+    suffix = datetime.now().strftime("%m%d%H%M")
+    return f"{base}{suffix}"
+
+def norm_deg(x: float) -> float:
+    while x > 180:
+        x -= 360
+    while x < -180:
+        x += 360
+    return x
+
+def clamp(val, lo, hi):
+    return max(lo, min(hi, val))
+
+def emg_rms(buf):
+    if not buf:
+        return 0.0
+    return math.sqrt(sum(x*x for x in buf) / len(buf))
 
 def reset_max_angles():
     with MAX_LOCK:
         MAX_ANGLES["hip"] = 0.0
         MAX_ANGLES["knee"] = 0.0
         MAX_ANGLES["ankle"] = 0.0
-
-
-# Dùng alias để tránh đè tên
-pyserial = None
-list_ports = None
-try:
-    if SERIAL_ENABLED:
-        import serial as pyserial
-        from serial.tools import list_ports
-except Exception:
-    SERIAL_ENABLED = False  # fallback
-
 
 def auto_detect_port():
     if not list_ports:
@@ -60,276 +139,238 @@ def auto_detect_port():
     return ports[0].device if ports else None
 
 
-try:
-    if SERIAL_ENABLED:
-        import serial, serial.tools.list_ports  # cần pyserial
-    else:
-        serial = None
-except Exception:
-    serial = None
-    SERIAL_ENABLED = False
-ser = None
-serial_thread = None
-stop_serial_thread = False
+# =========================
+#   HIP STATE (pitch2)
+# =========================
+HIP_STATE    = {"mode": "front", "prev_pitch2": 0.0}
+PITCH_MID    = 90.0
+PITCH_HYS    = 10.0
+HIP_CROSS_TH = 40.0
+DEADZONE     = 2.0
 
-def _exercise_region_from_name(name: str):
-    n = (name or "").lower()
-    if "hip" in n:
-        return "hip"
-    if "knee" in n:
-        return "knee"
-    if "ankle" in n:
-        return "ankle"
+
+# =========================
+#   SMOOTH FILTER
+# =========================
+_SMOOTH_STATE = {"hip": 0.0, "knee": 0.0, "ankle": 0.0}
+_SMOOTH_ALPHA = {"hip": 0.25, "knee": 0.25, "ankle": 0.25}
+
+def _smooth(key: str, x: float) -> float:
+    a = _SMOOTH_ALPHA.get(key, 0.25)
+    prev = _SMOOTH_STATE.get(key, x)
+    y = a * x + (1 - a) * prev
+    _SMOOTH_STATE[key] = y
+    return y
+
+
+# =========================
+#   SERIAL PARSER
+# =========================
+def parse_serial_line(line: str):
+    # IMU,sender_id,timestamp_ms,yaw,roll,pitch
+    # EMG,sender_id,timestamp_us,emg_clean
+    parts = [p.strip() for p in line.strip().split(",") if p.strip() != ""]
+    if not parts:
+        return None
+
+    tag = parts[0].upper()
+
+    try:
+        if tag == "IMU" and len(parts) >= 6:
+            sender_id = int(parts[1])
+            ts = int(float(parts[2]))  # đôi khi gửi "123.0"
+            yaw = float(parts[3])
+            roll = float(parts[4])
+            pitch = float(parts[5])
+            return ("imu", sender_id, ts, yaw, roll, pitch)
+
+        if tag == "EMG" and len(parts) >= 4:
+            sender_id = int(parts[1])
+            ts_us = int(float(parts[2]))
+            emg_clean = float(parts[3])
+            return ("emg", sender_id, ts_us, emg_clean)
+    except Exception:
+        return None
+
     return None
 
-# ==== Helpers toàn cục ====
-def norm_deg(x: float) -> float:
-    while x > 180:
-        x -= 360
-    while x < -180:
-        x += 360
-    return x
 
-
-def clamp(val, lo, hi):
-    return max(lo, min(hi, val))
-
-
-def start_serial_reader(port="COM5", baud=115200):
-    """Đọc dữ liệu serial: id,timestamp,yaw,roll,pitch (4 IMU, dùng pitch)."""
+# =========================
+#   SERIAL START/STOP (FIX PermissionError)
+# =========================
+def stop_serial_reader():
     global ser, serial_thread, stop_serial_thread
+    stop_serial_thread = True
+
+    # đóng port trước để tránh ClearCommError / Access denied
+    try:
+        if ser is not None:
+            try:
+                ser.close()
+            except Exception:
+                pass
+    finally:
+        ser = None
+
+    # join thread
+    try:
+        if serial_thread and serial_thread.is_alive():
+            serial_thread.join(timeout=1.0)
+    except Exception:
+        pass
+
+    serial_thread = None
+    return True
+
+
+def start_serial_reader(port=None, baud=115200):
+    """Đọc serial và gọi append_samples(); timestamp đồng nhất theo host time (ms)."""
+    global ser, serial_thread, stop_serial_thread
+
+    if not SERIAL_ENABLED or pyserial is None:
+        print("[SERIAL] pyserial not available")
+        return False
+
+    if not port:
+        port = os.environ.get("SERIAL_PORT") or auto_detect_port()
 
     if not port:
         print("Không tìm thấy cổng serial nào.")
         return False
 
+    # đảm bảo không mở chồng
+    stop_serial_reader()
+
     try:
         ser = pyserial.Serial(port, baud, timeout=0.5)
-        print(f" Đã mở {port} @ {baud}")
+        # clear buffers
+        try:
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+        except Exception:
+            pass
+        print(f"✅ Đã mở {port} @ {baud}")
     except Exception as e:
-        print("Không mở được cổng serial:", e)
+        print("❌ Không mở được cổng serial:", e)
         return False
 
     stop_serial_thread = False
     last_angles = defaultdict(lambda: {"yaw": 0.0, "roll": 0.0, "pitch": 0.0, "ts": 0.0})
 
-    def norm_deg(x: float) -> float:
-        while x > 180: x -= 360
-        while x < -180: x += 360
-        return x
-
     def reader_loop():
-        print(f" Đang đọc dữ liệu từ {port} @ {baud} ...")
-        import re
-        CSV_PAT = re.compile(
-            r'^\s*(-?\d+(?:\.\d+)?)[,\s]+(\d+(?:\.\d+)?)[,\s]+(-?\d+(?:\.\d+)?)[,\s]+(-?\d+(?:\.\d+)?)[,\s]+(-?\d+(?:\.\d+)?)\s*$'
-        )
+        print(f"📥 Đang đọc dữ liệu từ {port} @ {baud} ...")
+        global stop_serial_thread
 
         while not stop_serial_thread:
             try:
                 raw = ser.readline()
                 if not raw:
                     continue
+
                 line = raw.decode("utf-8", errors="ignore").strip()
                 if not line:
                     continue
 
-                # Lọc rác: chỉ nhận đúng CSV 5 số
-                m = CSV_PAT.match(line)
-                if not m:
+                parsed = parse_serial_line(line)
+                if not parsed:
                     continue
 
-                sid = int(float(m.group(1)))
-                ts = float(m.group(2))
-                yaw = float(m.group(3))
-                roll = float(m.group(4))
-                pitch = float(m.group(5))
+                ptype = parsed[0]
+                now_ms = time.time() * 1000.0  # ✅ timebase CHUNG
 
-                last_angles[sid] = {
-                    "yaw": yaw, "roll": roll, "pitch": pitch, "ts": ts
-                }
+                if ptype == "imu":
+                    _, sid, ts, yaw, roll, pitch = parsed
 
-                # Cho hiển thị tạm khi có >=2 IMU (test), đủ 1-4 thì lấy tương ứng
-                p1 = last_angles.get(1, {}).get("roll", 0.0)
-                p2 = last_angles.get(2, {}).get("roll", 0.0)
-                p3 = last_angles.get(3, {}).get("roll", 0.0)
-                p4 = -last_angles.get(4, {}).get("roll", 0.0)
-                pitch2 = last_angles.get(2, {}).get("pitch", 0.0)  # ⭐ pitch của IMU2
-                # Góc thô (chưa xử lý đổi hướng hip)
-                raw_hip   = norm_deg(p2 - p1)
-                raw_knee  = norm_deg(p3 - p2)
-                raw_ankle = norm_deg(p4 - p3)
+                    last_angles[sid] = {
+                        "yaw": yaw, "roll": roll, "pitch": pitch, "ts": ts
+                    }
 
-                # Gửi cả p2 để xử lý đổi dấu ở append_samples
-                append_samples([{
-                    "t_ms": ts or time.time() * 1000,
-                    "hip":   raw_hip,
-                    "knee":  raw_knee,
-                    "ankle": raw_ankle,
-                    "p2":    p2,
-                    "pitch2": pitch2
-                }])
+                    p1 = last_angles.get(1, {}).get("roll", 0.0)
+                    p2 = last_angles.get(2, {}).get("roll", 0.0)
+                    p3 = last_angles.get(3, {}).get("roll", 0.0)
+                    p4 = -last_angles.get(4, {}).get("roll", 0.0)
+                    pitch2 = last_angles.get(2, {}).get("pitch", 0.0)
 
+                    raw_hip = norm_deg(p2 - p1)
+                    raw_knee = norm_deg(p3 - p2)
+                    raw_ankle = norm_deg(p4 - p3)
+
+                    append_samples([{
+                        "t_ms": now_ms,
+                        "hip": raw_hip,
+                        "knee": raw_knee,
+                        "ankle": raw_ankle,
+                        "pitch2": pitch2
+                    }])
+
+                elif ptype == "emg":
+                    _, sender_id, ts_us, emg_clean = parsed
+                    emg_rect = abs(float(emg_clean))
+
+                    emg_entry = {
+                        "v": emg_rect,
+                        "t_ms": now_ms,
+                        "sender_id": int(sender_id)
+                    }
+
+                    with EMG_LOCK:
+                        EMG_BUF.append(emg_rect)
+                        LAST_EMG["emg"] = emg_entry
 
             except Exception as e:
+                # nếu port bị rút ra hoặc bị close, thoát vòng lặp
+                msg = str(e)
                 print("Serial read error:", e)
+                if "ClearCommError" in msg or "Access is denied" in msg:
+                    break
 
-        print(" Dừng đọc serial")
+        print("🛑 Dừng đọc serial")
 
     serial_thread = threading.Thread(target=reader_loop, daemon=True)
     serial_thread.start()
     return True
 
 
-from flask import Flask, render_template_string, request, redirect, url_for, flash
-from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
-from werkzeug.security import generate_password_hash, check_password_hash
-from flask_socketio import SocketIO
-
-# ================= Firebase Admin SDK =================
-import firebase_admin
-from firebase_admin import credentials, firestore
-
-
-def find_firebase_key():
-    candidates = [
-        os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"),
-        "/etc/secrets/firebase-key.json",
-        os.path.join(os.environ.get("RENDER_SECRETS_DIR", ""), "firebase-key.json"),
-        os.path.join(os.getcwd(), "firebase-key.json"),
-    ]
-    for p in candidates:
-        if p and os.path.isfile(p):
-            return p
-    return None
-
-
-fs_client = None
-try:
-    CRED_PATH = find_firebase_key()
-    if CRED_PATH:
-        cred = credentials.Certificate(CRED_PATH)
-        firebase_admin.initialize_app(cred)
-        fs_client = firestore.client()
-        print(" Firebase initialized")
-    else:
-        print("ℹ  Firebase key not found → chạy local không dùng Firestore")
-except Exception as e:
-    print("  Firebase init skipped:", e)
-    fs_client = None
-
-# ===================== App & Auth =====================
-app = Flask(__name__)
-app.secret_key = "CHANGE_ME"  # nhớ đổi khi deploy
-PATIENTS_FILE = "sample.json"
-EXPORT_DIR = "exports"
-os.makedirs(EXPORT_DIR, exist_ok=True)
-
-
-# chỗ khởi tạo SocketIO
-socketio = SocketIO(
-    app,
-    cors_allowed_origins="*",
-    ping_interval=10,  # giây
-    ping_timeout=30,  # giây
-    async_mode="threading",
-)
-from flask_socketio import emit
-
-
-@socketio.on('connect')
-def _on_connect():
-    print('[SOCKET] client connected')
-    emit('imu_data', {
-        "t": time.time() * 1000,
-        "hip": 0,
-        "knee": 0,
-        "ankle": 0
-    })
-
-@app.post("/api/delete_record")
-@login_required
-def api_delete_record():
-    global RECORD_STORE
-    data = request.get_json(force=True) or {}
-    try:
-        idx = int(data.get("index", -1))
-    except (TypeError, ValueError):
-        return jsonify(ok=False, msg="Index không hợp lệ"), 400
-
-    with RECORD_LOCK:
-        if 0 <= idx < len(RECORD_STORE):
-            RECORD_STORE.pop(idx)
-            save_records_to_file()
-            return jsonify(ok=True)
-        else:
-            return jsonify(ok=False, msg="Không tìm thấy bản ghi"), 404
-
-@app.post("/session/mock")
-@login_required
-def session_mock():
-    for i in range(30):
-        append_samples([{
-            "t_ms": time.time() * 1000,
-            "hip": 10 + i * 0.5,
-            "knee": 20 + i * 0.3,
-            "ankle": -5 + i * 0.2,
-        }])
-        time.sleep(0.1)
-    return {"ok": True, "mode": "mock"}
-
-
+# =========================
+#   APPEND SAMPLES + EMIT
+# =========================
 def append_samples(samples):
-    global data_buffer, HIP_STATE
+    """Xử lý hip/knee/ankle + sync EMG, rồi emit socket 'imu_data'."""
+    global EMG_ENV, HIP_STATE
+
+    SYNC_WIN_MS = 80       # ✅ rộng hơn chút để chắc ăn khi PC lag
+    EMG_SENSOR_ID = 5
 
     for s in samples:
-        t_ms = s.get("t_ms", time.time() * 1000)
+        t_ms = float(s.get("t_ms", time.time() * 1000.0))
 
-        # Góc thô từ reader_loop
         raw_hip = float(s.get("hip", 0.0))
         knee    = float(s.get("knee", 0.0))
         ankle   = float(s.get("ankle", 0.0))
-
-        p2      = float(s.get("p2", 0.0))
         pitch2  = float(s.get("pitch2", 0.0))
 
-        # ====== DÙNG pitch2 ĐỂ CHỌN HƯỚNG HIP (với hysteresis + biên độ) ======
-        mode        = HIP_STATE.get("mode", "front")   # 'front' hoặc 'back'
-        prev_pitch2 = HIP_STATE.get("prev_pitch2", 0.0)
-
-        # Chỉ cho phép đổi mode khi chân gần thẳng (|raw_hip| nhỏ)
+        # ---- hip sign theo pitch2
+        mode = HIP_STATE.get("mode", "front")
         if abs(raw_hip) < HIP_CROSS_TH:
-            # pitch2 thấp hẳn → chắc chắn đang gập ra TRƯỚC
             if pitch2 <= (PITCH_MID - PITCH_HYS):
                 mode = "front"
-            # pitch2 cao hẳn → chắc chắn đang gập ra SAU
             elif pitch2 >= (PITCH_MID + PITCH_HYS):
                 mode = "back"
-            # nếu pitch2 nằm giữa [80,100] thì giữ nguyên mode cũ, tránh nhảy liên tục
-
-        HIP_STATE["mode"]        = mode
-        HIP_STATE["prev_pitch2"] = pitch2
-
+        HIP_STATE["mode"] = mode
         sign_front = 1 if mode == "front" else -1
 
-        # Biên độ hip + deadzone quanh 0 cho mượt
         mag_hip = abs(raw_hip)
-        if mag_hip < DEADZONE:
-            hip = 0.0
-        else:
-            hip = sign_front * mag_hip
+        hip = 0.0 if mag_hip < DEADZONE else sign_front * mag_hip
 
-        # ====== CLAMP ======
         hip   = clamp(hip,  -30.1, 122.1)
         knee  = clamp(abs(knee),   0, 134)
         ankle = clamp(abs(ankle), 36, 113)
 
-        # ====== LÀM MƯỢT ======
         hip   = _smooth("hip", hip)
         knee  = _smooth("knee", knee)
         ankle = _smooth("ankle", ankle)
 
-        # ====== CẬP NHẬT MAX ======
+        # ---- max angles
         with MAX_LOCK:
             if hip   > MAX_ANGLES["hip"]:   MAX_ANGLES["hip"]   = hip
             if knee  > MAX_ANGLES["knee"]:  MAX_ANGLES["knee"]  = knee
@@ -341,16 +382,47 @@ def append_samples(samples):
                 "maxAnkle": MAX_ANGLES["ankle"],
             }
 
-        # ====== LƯU BUFFER ======
+        # ---- sync EMG: lấy LAST_EMG gần nhất theo host-time
+        emg_v = None
+        emg_id = None
+
+        with EMG_LOCK:
+            emg = LAST_EMG.get("emg")
+
+        if emg:
+            try:
+                emg_id = int(emg.get("sender_id", -1))
+                if emg_id == EMG_SENSOR_ID:
+                    if abs(float(emg.get("t_ms", 0)) - t_ms) <= SYNC_WIN_MS:
+                        emg_v = float(emg.get("v", 0.0))
+            except Exception:
+                emg_v = None
+                emg_id = None
+
+        # ---- RMS & envelope (nếu có emg_v)
+        if emg_v is not None:
+            rms = emg_rms(EMG_BUF)
+            EMG_ENV = EMG_ALPHA * rms + (1 - EMG_ALPHA) * EMG_ENV
+            max_payload["emg"] = emg_v                 # ✅ emg là SỐ (frontend vẽ được)
+            max_payload["sender_id"] = emg_id          # ✅ cho JS lọc sensor 5
+            max_payload["emg_id"] = emg_id
+            max_payload["emg_rms"] = rms
+            max_payload["emg_env"] = EMG_ENV
+
+        # ---- lưu buffer
         with DATA_LOCK:
             data_buffer.append({
                 "t_ms": t_ms,
-                "hip":  hip,
+                "hip": hip,
                 "knee": knee,
-                "ankle": ankle
+                "ankle": ankle,
+                "emg": max_payload.get("emg"),
+                "emg_id": max_payload.get("emg_id"),
+                "emg_rms": max_payload.get("emg_rms"),
+                "emg_env": max_payload.get("emg_env"),
             })
 
-        # ====== EMIT RA UI ======
+        # ---- emit ra UI
         socketio.emit("imu_data", {
             "t": t_ms,
             "hip": hip,
@@ -360,37 +432,226 @@ def append_samples(samples):
         })
 
 
+# =========================
+#   RECORDS LOAD/SAVE
+# =========================
+def load_records_from_file():
+    global RECORD_STORE
+    try:
+        with open(RECORD_FILE, "r", encoding="utf-8") as f:
+            RECORD_STORE = json.load(f)
+            if not isinstance(RECORD_STORE, list):
+                RECORD_STORE = []
+    except FileNotFoundError:
+        RECORD_STORE = []
+    except Exception as e:
+        print("[WARN] load_records_from_file error:", e)
+        RECORD_STORE = []
+
+def save_records_to_file():
+    try:
+        with open(RECORD_FILE, "w", encoding="utf-8") as f:
+            json.dump(RECORD_STORE, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("[WARN] save_records_to_file error:", e)
 
 
+# =========================
+#   APP / SOCKET
+# =========================
+app = Flask(__name__)
+app.secret_key = "CHANGE_ME"
 
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    ping_interval=10,
+    ping_timeout=30,
+    async_mode="threading",
+)
+
+@socketio.on("connect")
+def _on_connect():
+    print("[SOCKET] client connected")
+    emit("imu_data", {"t": time.time() * 1000, "hip": 0, "knee": 0, "ankle": 0})
+
+
+# =========================
+#   LOGIN
+# =========================
 login_manager = LoginManager(app)
 login_manager.login_view = "login"
-
-USERS = {"komlab": generate_password_hash("123456")}  # đổi khi deploy
-
-# Map bài tập -> đường dẫn video (trong static/videos/)
-EXERCISE_VIDEOS = {
-    "ankle flexion": "/static/videos/ankle flexion.mp4",
-    "hip flexion": "/static/videos/hip flexion.mp4",
-    "knee flexion": "/static/videos/knee flexion.mp4",
-}
-
+USERS = {"komlab": generate_password_hash("123456")}
 
 class User(UserMixin):
     def __init__(self, u): self.id = u
 
-
 @login_manager.user_loader
-def load_user(u): return User(u) if u in USERS else None
+def load_user(u):
+    return User(u) if u in USERS else None
 
 
-# ===================== Patient helpers =====================
-def _ensure_patients_file():
-    if not os.path.exists(PATIENTS_FILE):
-        with open(PATIENTS_FILE, "w", encoding="utf-8") as f:
-            json.dump({}, f, ensure_ascii=False, indent=2)
+# =========================
+#   VIDEOS (FIX space -> underscore)
+# =========================
+EXERCISE_VIDEOS = {
+    "ankle flexion": "/static/videos/ankle_flexion.mp4",
+    "knee flexion":  "/static/videos/knee_flexion.mp4",
+    "hip flexion":   "/static/videos/hip_flexion.mp4",
+}
 
 
+# =========================
+#   ROUTES
+# =========================
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error_message = None
+    if request.method == "POST":
+        u = request.form.get("username", "").strip()
+        p = request.form.get("password", "")
+        if u in USERS and check_password_hash(USERS[u], p):
+            login_user(User(u))
+            return redirect(url_for("dashboard"))
+        error_message = "Sai tài khoản hoặc mật khẩu"
+    return render_template_string(LOGIN_HTML, error_message=error_message)
+
+@app.route("/logout")
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for("login"))
+
+@app.route("/")
+@login_required
+def dashboard():
+    return render_template_string(DASH_HTML, username=current_user.id, videos=EXERCISE_VIDEOS)
+
+@app.route("/settings")
+@login_required
+def settings_page():
+    return render_template_string(SETTINGS_HTML, username=current_user.id)
+
+@app.route("/calibration")
+@login_required
+def calibration():
+    open_guide = request.args.get("guide", "0") in ("1", "true", "yes")
+    return render_template_string(CALIBRATION_HTML, username=current_user.id, open_guide=open_guide)
+
+@app.route("/ports")
+@login_required
+def ports():
+    if not list_ports:
+        return jsonify(ports=[])
+    items = [{"device": p.device, "desc": p.description} for p in list_ports.comports()]
+    return jsonify(ports=items)
+
+@app.post("/session/start")
+@login_required
+def session_start():
+    global data_buffer
+    data_buffer = []
+    reset_max_angles()
+
+    if SERIAL_ENABLED:
+        port = os.environ.get("SERIAL_PORT") or "COM7"
+        baud = int(os.environ.get("SERIAL_BAUD", "115200"))
+        ok = start_serial_reader(port=port, baud=baud)
+        if not ok:
+            return jsonify(ok=False, msg=f"Không mở được cổng serial (port={port})"), 500
+        return jsonify(ok=True, mode="serial", port=port, baud=baud)
+
+    return jsonify(ok=True, mode="noserial")
+
+@app.post("/session/stop")
+@login_required
+def session_stop():
+    global LAST_SESSION
+
+    if SERIAL_ENABLED:
+        stop_serial_reader()
+
+    with DATA_LOCK:
+        LAST_SESSION = list(data_buffer)
+        data_buffer.clear()
+
+    print(f"[SESSION STOP] saved {len(LAST_SESSION)} samples")
+    return jsonify(ok=True, msg="Đã kết thúc phiên đo")
+
+@app.post("/session/reset_max")
+@login_required
+def session_reset_max():
+    reset_max_angles()
+    socketio.emit("imu_data", {
+        "t": time.time() * 1000,
+        "maxHip": 0.0, "maxKnee": 0.0, "maxAnkle": 0.0
+    })
+    return jsonify(ok=True)
+
+@app.post("/session/mock")
+@login_required
+def session_mock():
+    for i in range(80):
+        append_samples([{
+            "t_ms": time.time() * 1000,
+            "hip": 10 + i * 0.2,
+            "knee": 20 + i * 0.15,
+            "ankle": 60 + i * 0.1,
+            "pitch2": 85
+        }])
+        time.sleep(0.03)
+    return jsonify(ok=True, mode="mock")
+
+@app.get("/session/export_csv")
+@login_required
+def session_export_csv():
+    patient_code = request.args.get("patient_code", "").strip()
+
+    with DATA_LOCK:
+        rows = list(LAST_SESSION) if LAST_SESSION else list(data_buffer)
+
+    sio = io.StringIO()
+    w = csv.writer(sio)
+    # ✅ header đúng
+    w.writerow(["t_ms", "hip", "knee", "ankle", "emg", "emg_rms", "emg_env", "emg_id"])
+
+    for r in rows:
+        w.writerow([
+            int(r.get("t_ms", 0)),
+            f'{float(r.get("hip", 0)):.4f}',
+            f'{float(r.get("knee", 0)):.4f}',
+            f'{float(r.get("ankle", 0)):.4f}',
+            "" if r.get("emg") is None else f'{float(r.get("emg", 0)):.5f}',
+            "" if r.get("emg_rms") is None else f'{float(r.get("emg_rms", 0)):.5f}',
+            "" if r.get("emg_env") is None else f'{float(r.get("emg_env", 0)):.5f}',
+            "" if r.get("emg_id") is None else str(r.get("emg_id")),
+        ])
+
+    csv_text = sio.getvalue()
+    data = io.BytesIO(csv_text.encode("utf-8-sig"))
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    safe_code = "".join(ch for ch in patient_code if ch.isalnum() or ch in ("-", "_"))
+    filename = f"{safe_code}_{ts}_{len(rows)}rows.csv" if safe_code else f"imu_{ts}_{len(rows)}rows.csv"
+
+    # lưu ra disk
+    try:
+        disk_path = os.path.join(EXPORT_DIR, filename)
+        with open(disk_path, "w", encoding="utf-8-sig", newline="") as f:
+            f.write(csv_text)
+    except Exception as e:
+        print("[WARN] cannot save CSV to disk:", e)
+
+    data.seek(0)
+    return send_file(
+        data,
+        mimetype="text/csv",
+        as_attachment=True,
+        download_name=filename,
+        max_age=0,
+    )
+
+# ========= Patients API (giữ như bạn đang dùng) =========
 def load_patients_rows():
     _ensure_patients_file()
     with open(PATIENTS_FILE, "r", encoding="utf-8") as f:
@@ -409,436 +670,20 @@ def load_patients_rows():
     rows = sorted(rows, key=lambda r: (r["full_name"] or "").lower())
     return rows, data
 
-
-def add_patient_to_file(full_name, national_id, dob, sex, weight, height):
-    rows, raw = load_patients_rows()
-    patient_code = gen_patient_code(full_name)
-
-    g = (sex or "").strip()
-    if g.lower().startswith("m"):
-        g = "Male"
-    elif g.lower().startswith("f"):
-        g = "FeMale"
-
-    raw[patient_code] = {
-        "DateOfBirth": dob or "",
-        "Exercise": {},
-        "Gender": g,
-        "Height": height or "",
-        "ID": national_id or "",
-        "PatientCode": patient_code,
-        "Weight": weight or "",
-        "name": full_name
-    }
-    with open(PATIENTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(raw, f, ensure_ascii=False, indent=2)
-    return patient_code
-
-def load_records_from_file():
-    global RECORD_STORE
-    try:
-        with open(RECORD_FILE, "r", encoding="utf-8") as f:
-            RECORD_STORE = json.load(f)
-    except FileNotFoundError:
-        RECORD_STORE = []
-    except Exception as e:
-        print("[WARN] load_records_from_file error:", e)
-        RECORD_STORE = []
-
-def save_records_to_file():
-    try:
-        with open(RECORD_FILE, "w", encoding="utf-8") as f:
-            json.dump(RECORD_STORE, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print("[WARN] save_records_to_file error:", e)
-
-# gọi 1 lần khi start server
-load_records_from_file()
-
-def gen_patient_code(full_name: str) -> str:
-    last = (full_name.split()[-1] if full_name else "BN")
-    base = "".join(ch for ch in last if ch.isalnum())
-    suffix = datetime.now().strftime("%m%d%H%M")
-    return f"{base}{suffix}"
-
-
-# ===================== Routes =====================
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    error_message = None
-
-    if request.method == "POST":
-        u = request.form.get("username", "").strip()
-        p = request.form.get("password", "")
-
-        if u in USERS and check_password_hash(USERS[u], p):
-            login_user(User(u))
-            return redirect(url_for("dashboard"))
-        else:
-            # Sai tài khoản hoặc mật khẩu → gửi xuống HTML
-            error_message = "Sai tài khoản hoặc mật khẩu"
-
-    return render_template_string(LOGIN_HTML, error_message=error_message)
-@app.route("/settings")
-@login_required
-def settings_page():
-    return render_template_string(
-        SETTINGS_HTML,
-        username=current_user.id
-    )
-
-
-
-@app.route("/save_vas", methods=["POST"])
-def save_vas():
-    data = request.get_json(silent=True) or {}
-
-    # lấy giá trị VAS
-    try:
-        vas = float(data.get("vas", None))
-    except (TypeError, ValueError):
-        return jsonify(ok=False, msg="Giá trị VAS không hợp lệ"), 400
-
-    exercise_region = (data.get("exercise_region") or "").strip()
-    phase           = (data.get("phase") or "").strip()        # 'before' / 'after'
-    exercise_name   = (data.get("exercise_name") or "").strip()
-    patient_code    = (data.get("patient_code") or "").strip()
-
-    if phase not in ("before", "after"):
-        return jsonify(ok=False, msg="Thiếu hoặc sai phase (before/after)."), 400
-    if not exercise_region:
-        return jsonify(ok=False, msg="Thiếu exercise_region."), 400
-
-    rec = {
-        "patient_code":    patient_code or None,
-        "exercise_name":   exercise_name or None,
-        "exercise_region": exercise_region,
-        "phase":           phase,
-        "vas":             vas,
-        "ts":              time.time(),
-    }
-
-    with VAS_LOCK:
-        VAS_STORE.append(rec)
-
-    print("== VAS saved ==", rec)
-    return jsonify(ok=True)
-
-@app.post("/api/save_record")
-@login_required
-def api_save_record():
-    global RECORD_STORE
-    data = request.get_json(force=True) or {}
-
-    patient_code    = (data.get("patient_code") or "").strip()
-    measure_date    = data.get("measure_date") or ""
-    patient_info    = data.get("patient_info") or {}
-    exercise_scores = data.get("exercise_scores") or {}
-
-    # --- GOM VAS ---
-    vas_summary = {}
-    pat_filter = patient_code
-
-    with VAS_LOCK:
-        for row in VAS_STORE:
-            pc_row = (row.get("patient_code") or "").strip()
-            ex     = (row.get("exercise_name") or "").strip()
-            ph     = (row.get("phase") or "").strip()
-            val    = row.get("vas")
-
-            if pat_filter and pc_row and pc_row != pat_filter:
-                continue
-            if not ex or ph not in ("before", "after"):
-                continue
-
-            if ex not in vas_summary:
-                vas_summary[ex] = {"before": None, "after": None}
-            vas_summary[ex][ph] = val
-
-    # ===== dùng giờ Việt Nam thay vì UTC =====
-    now = datetime.now(VN_TZ)
-    ts  = now.timestamp()
-    # chuỗi hiển thị: 2025-12-11 14:47:22
-    display_str = now.strftime("%Y-%m-%d %H:%M:%S")
-
-    record = {
-        "created_at_ts": ts,          # để sort mới nhất
-        "created_at":    display_str, # để hiển thị "Thời gian lưu"
-
-        "patient_code":    patient_code,
-        "measure_date":    measure_date,
-        "patient_info":    patient_info,
-        "exercise_scores": exercise_scores,
-        "vas_summary":     vas_summary,
-    }
-
-    with RECORD_LOCK:
-        RECORD_STORE.append(record)
-        save_records_to_file()
-
-    return jsonify(ok=True, msg="saved", record=record)
-
-@app.route("/records")
-@login_required
-def records():
-    # copy ra ngoài lock để sort/render
-    with RECORD_LOCK:
-        rows = list(RECORD_STORE)
-
-    # sort theo timestamp giảm dần
-    rows.sort(key=lambda r: r.get("saved_at_ts", 0), reverse=True)
-
-    # đảm bảo luôn có vas_summary
-    for r in rows:
-        if "vas_summary" not in r or r["vas_summary"] is None:
-            r["vas_summary"] = {}
-
-    return render_template_string(
-        RECORD_HTML,   # hoặc RECORDS_HTML nếu bạn đặt tên vậy
-        username=current_user.id,
-        records=rows,
-    )
-
-@app.route("/register", methods=["POST"])
-def register():
-    username = request.form.get("reg_username", "").strip()
-    pw1      = request.form.get("reg_password", "")
-    pw2      = request.form.get("reg_password2", "")
-
-    if not username or not pw1:
-        # thiếu dữ liệu → quay lại trang login
-        flash("Vui lòng nhập đầy đủ tài khoản và mật khẩu", "danger")
-        return redirect(url_for("login"))
-
-    if pw1 != pw2:
-        flash("Mật khẩu nhập lại không khớp", "danger")
-        return redirect(url_for("login"))
-
-    global USERS
-    if username in USERS:
-        flash("Tài khoản đã tồn tại", "danger")
-        return redirect(url_for("login"))
-
-    USERS[username] = generate_password_hash(pw1)
-    flash("Đăng ký thành công, vui lòng đăng nhập", "success")
-    return redirect(url_for("login"))
-
-
-@app.route("/logout")
-@login_required
-def logout():
-    logout_user()
-    return redirect(url_for("login"))
-
-
-@app.route("/")
-@login_required
-def dashboard():
-    return render_template_string(
-        DASH_HTML,
-        username=current_user.id,
-        videos=EXERCISE_VIDEOS
-    )
-
-
-@app.post("/session/start")
-@login_required
-def session_start():
-    global data_buffer
-    data_buffer = []
-    print(f"[SESSION] SERIAL_ENABLED={SERIAL_ENABLED}")
-    if SERIAL_ENABLED:
-        port = "COM5"
-        baud = int(os.environ.get("SERIAL_BAUD", "115200"))
-        print(f"[SESSION] will open port={port} baud={baud}")
-        ok = start_serial_reader(port=port, baud=baud)
-        print(f"[SESSION] start_serial_reader ok={ok}")
-        if not ok:
-            return {"ok": False, "msg": f"Không mở được cổng serial (port={port})"}, 500
-        return {"ok": True, "mode": "serial", "port": port, "baud": baud}
-    else:
-        print("[SESSION] SERIAL is DISABLED → noserial mode")
-        return {"ok": True, "mode": "noserial"}
-
-
-@app.get("/session/export_csv")
-@login_required
-def session_export_csv():
-    """
-    Xuất CSV cho phiên đo:
-      - Nếu đã bấm KẾT THÚC ĐO → dùng LAST_SESSION
-      - Nếu chưa kết thúc mà bấm export → dùng data_buffer
-      - Nếu có patient_code → gắn vào tên file + lưu link vào JSON bệnh nhân
-    """
-    global LAST_SESSION
-
-    patient_code = request.args.get("patient_code", "").strip()
-
-    with DATA_LOCK:
-        if LAST_SESSION:
-            rows = list(LAST_SESSION)   # phiên đo gần nhất
-        else:
-            rows = list(data_buffer)    # dữ liệu đang đo (fallback)
-
-    if not rows:
-        rows = []
-
-    # Tạo CSV text
-    sio = io.StringIO()
-    w = csv.writer(sio)
-    w.writerow(["t_ms", "hip_deg", "knee_deg", "ankle_deg"])
-    for r in rows:
-        w.writerow([
-            int(r.get("t_ms", 0)),
-            f'{float(r.get("hip",   0)):.4f}',
-            f'{float(r.get("knee",  0)):.4f}',
-            f'{float(r.get("ankle", 0)):.4f}',
-        ])
-
-    csv_text = sio.getvalue()
-    data = io.BytesIO(csv_text.encode("utf-8-sig"))
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # sanitize mã bệnh nhân để đưa vào tên file
-    safe_code = "".join(ch for ch in patient_code if ch.isalnum() or ch in ("-", "_"))
-    if safe_code:
-        filename = f"{safe_code}_{ts}_{len(rows)}rows.csv"
-    else:
-        filename = f"imu_{ts}_{len(rows)}rows.csv"
-
-    #  Lưu file vật lý vào thư mục exports/
-    try:
-        os.makedirs(EXPORT_DIR, exist_ok=True)
-        disk_path = os.path.join(EXPORT_DIR, filename)
-        with open(disk_path, "w", encoding="utf-8-sig", newline="") as f:
-            f.write(csv_text)
-
-        #  Nếu có patient_code thì lưu link file vào JSON bệnh nhân
-        if patient_code:
-            _ensure_patients_file()
-            with open(PATIENTS_FILE, "r", encoding="utf-8") as f:
-                pdata = json.load(f) or {}
-
-            rec = pdata.get(patient_code)
-            if rec is not None:
-                ex = rec.get("Exercise") or {}
-                key = ts  # mỗi lần export 1 key mới theo timestamp
-                ex[key] = {
-                    "csv_file": disk_path,
-                    "export_time": ts,
-                    "n_samples": len(rows),
-                }
-                rec["Exercise"] = ex
-                pdata[patient_code] = rec
-
-                with open(PATIENTS_FILE, "w", encoding="utf-8") as f:
-                    json.dump(pdata, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print("Không lưu được CSV vật lý hoặc cập nhật JSON:", e)
-        # vẫn trả file CSV xuống cho user, chỉ là không lưu được metadata
-
-    data.seek(0)
-    return send_file(
-        data,
-        mimetype="text/csv",
-        as_attachment=True,
-        download_name=filename,
-        max_age=0,
-    )
-
-
-
-@app.post("/session/stop")
-@login_required
-def session_stop():
-    global LAST_SESSION, data_buffer
-
-    # nếu đang đọc serial thì dừng
-    if SERIAL_ENABLED:
-        stop_serial_reader()
-
-    #  LƯU LẠI PHIÊN ĐO GẦN NHẤT ĐỂ VẼ BIỂU ĐỒ
-    LAST_SESSION = list(data_buffer)  # clone mảng
-    print(f"[SESSION STOP] saved {len(LAST_SESSION)} samples")
-
-    # xóa buffer để không bị lẫn vào lần đo sau
-    data_buffer.clear()
-
-    return {"ok": True, "msg": "Đã kết thúc phiên đo"}
-
-
-@app.post("/session/reset_max")
-@login_required
-def session_reset_max():
-    reset_max_angles()
-    # Phát lại max=0 để UI cập nhật ngay
-    socketio.emit("imu_data", {
-        "t": time.time() * 1000,
-        "hip": None, "knee": None, "ankle": None,
-        "maxHip": 0.0, "maxKnee": 0.0, "maxAnkle": 0.0
-    })
-    return {"ok": True}
-
-
-@app.route("/patients")
-@login_required
-def patients_list():
-    rows, _ = load_patients_rows()
-    return render_template_string(PATIENT_NEW_HTML, rows=rows)
-
-
-@app.route("/patients/new", methods=["GET", "POST"])
-@login_required
-def patients_new():
-    if request.method == "POST":
-        full_name = request.form.get("full_name", "").strip()
-        national_id = request.form.get("national_id", "").strip()
-        dob = request.form.get("dob", "").strip()
-        sex = request.form.get("sex", "").strip()
-        weight = request.form.get("weight", "").strip()
-        height = request.form.get("height", "").strip()
-
-        if not full_name:
-            flash("Vui lòng nhập Họ và tên", "danger")
-            return render_template_string(PATIENT_NEW_HTML)
-
-        code = add_patient_to_file(full_name, national_id, dob, sex, weight, height)
-        flash(f"Đã lưu bệnh nhân mới: {code}", "success")
-        return redirect(url_for("patients_list"))
-    return render_template_string(PATIENT_NEW_HTML)
-
-
-@app.route("/patients/manage")
-@login_required
-def patients_manage():
-    return render_template_string(PATIENTS_MANAGE_HTML)
-
-
-@app.route("/ports")
-@login_required
-def ports():
-    if not list_ports:
-        return {"ports": []}
-    items = [{"device": p.device, "desc": p.description} for p in list_ports.comports()]
-    return {"ports": items}
-
-
 @app.get("/api/patients")
 @login_required
 def api_patients_all():
     rows, raw = load_patients_rows()
-    return {"rows": rows, "raw": raw}
-
+    return jsonify(rows=rows, raw=raw)
 
 @app.post("/api/patients")
 @login_required
 def api_patients_save():
-    data = request.json or {}
+    data = request.get_json(force=True) or {}
     code = (data.get("patient_code") or "").strip()
     full_name = (data.get("name") or "").strip()
     if not full_name:
-        return {"ok": False, "msg": "Thiếu họ tên"}, 400
+        return jsonify(ok=False, msg="Thiếu họ tên"), 400
 
     _, raw = load_patients_rows()
     if not code:
@@ -862,127 +707,168 @@ def api_patients_save():
     }
     with open(PATIENTS_FILE, "w", encoding="utf-8") as f:
         json.dump(raw, f, ensure_ascii=False, indent=2)
-    return {"ok": True, "patient_code": code}
 
+    return jsonify(ok=True, patient_code=code)
 
-@app.delete("/api/patients/<code>")
+# ========= VAS =========
+@app.route("/save_vas", methods=["POST"])
+def save_vas():
+    data = request.get_json(silent=True) or {}
+    try:
+        vas = float(data.get("vas", None))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, msg="Giá trị VAS không hợp lệ"), 400
+
+    exercise_region = (data.get("exercise_region") or "").strip()
+    phase           = (data.get("phase") or "").strip()
+    exercise_name   = (data.get("exercise_name") or "").strip()
+    patient_code    = (data.get("patient_code") or "").strip()
+
+    if phase not in ("before", "after"):
+        return jsonify(ok=False, msg="Sai phase (before/after)."), 400
+    if not exercise_region:
+        return jsonify(ok=False, msg="Thiếu exercise_region."), 400
+
+    rec = {
+        "patient_code": patient_code or None,
+        "exercise_name": exercise_name or None,
+        "exercise_region": exercise_region,
+        "phase": phase,
+        "vas": vas,
+        "ts": time.time(),
+    }
+    with VAS_LOCK:
+        VAS_STORE.append(rec)
+
+    print("== VAS saved ==", rec)
+    return jsonify(ok=True)
+
+# ========= Records =========
+load_records_from_file()
+
+@app.post("/api/save_record")
 @login_required
-def api_patients_delete(code):
-    _, raw = load_patients_rows()
-    if code in raw:
-        raw.pop(code)
-        with open(PATIENTS_FILE, "w", encoding="utf-8") as f:
-            json.dump(raw, f, ensure_ascii=False, indent=2)
-        return {"ok": True}
-    return {"ok": False, "msg": "Không tìm thấy"}, 404
+def api_save_record():
+    global RECORD_STORE
+    data = request.get_json(force=True) or {}
 
+    patient_code    = (data.get("patient_code") or "").strip()
+    measure_date    = data.get("measure_date") or ""
+    patient_info    = data.get("patient_info") or {}
+    exercise_scores = data.get("exercise_scores") or {}
 
-@app.delete("/api/patients")
+    vas_summary = {}
+    with VAS_LOCK:
+        for row in VAS_STORE:
+            pc_row = (row.get("patient_code") or "").strip()
+            ex     = (row.get("exercise_name") or "").strip()
+            ph     = (row.get("phase") or "").strip()
+            val    = row.get("vas")
+
+            if patient_code and pc_row and pc_row != patient_code:
+                continue
+            if not ex or ph not in ("before", "after"):
+                continue
+            vas_summary.setdefault(ex, {"before": None, "after": None})
+            vas_summary[ex][ph] = val
+
+    now = datetime.now(VN_TZ)
+    record = {
+        "created_at_ts": now.timestamp(),
+        "created_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "patient_code": patient_code,
+        "measure_date": measure_date,
+        "patient_info": patient_info,
+        "exercise_scores": exercise_scores,
+        "vas_summary": vas_summary,
+    }
+
+    with RECORD_LOCK:
+        RECORD_STORE.append(record)
+        save_records_to_file()
+
+    return jsonify(ok=True, msg="saved", record=record)
+
+@app.route("/records")
 @login_required
-def api_patients_clear_all():
-    with open(PATIENTS_FILE, "w", encoding="utf-8") as f:
-        json.dump({}, f, ensure_ascii=False, indent=2)
-    return {"ok": True}
+def records():
+    with RECORD_LOCK:
+        rows = list(RECORD_STORE)
+    rows.sort(key=lambda r: r.get("created_at_ts", 0), reverse=True)
+    for r in rows:
+        if "vas_summary" not in r or r["vas_summary"] is None:
+            r["vas_summary"] = {}
+    return render_template_string(RECORD_HTML, username=current_user.id, records=rows)
 
 
-# ====== NEW: Trang Hiệu chuẩn kiểu lưới như ảnh ======
-@app.route("/calibration")
-@login_required
-def calibration():
-    open_guide = request.args.get("guide", "0") in ("1", "true", "yes")
-    return render_template_string(CALIBRATION_HTML, username=current_user.id, open_guide=open_guide)
-
+# ========= Charts =========
+def _exercise_region_from_name(name: str):
+    n = (name or "").lower()
+    if "hip" in n: return "hip"
+    if "knee" in n: return "knee"
+    if "ankle" in n: return "ankle"
+    return None
 
 @app.route("/charts")
 @login_required
 def charts():
-    global LAST_SESSION, VAS_STORE  # nhớ có VAS_STORE ở trên
+    global LAST_SESSION
 
-    patient_code   = request.args.get("patient_code", "").strip()
-    exercise_name  = request.args.get("exercise", "").strip()  # tên bài tập hiện tại
+    patient_code  = request.args.get("patient_code", "").strip()
+    exercise_name = request.args.get("exercise", "").strip()
 
-    # ===== 1. LẤY VAS TRƯỚC / SAU CHO BÀI HIỆN TẠI =====
     vas_before = None
-    vas_after  = None
-
-    # Hàm này bạn định nghĩa ở trên (như mình gợi ý):
-    # def _exercise_region_from_name(name: str):
-    #     n = (name or "").lower()
-    #     if "hip" in n: return "hip"
-    #     if "knee" in n: return "knee"
-    #     if "ankle" in n: return "ankle"
-    #     return None
+    vas_after = None
     region = _exercise_region_from_name(exercise_name)
 
     if region is not None:
-        # Duyệt ngược để lấy bản ghi mới nhất
-        with VAS_LOCK:  # nhớ khai báo VAS_LOCK = threading.Lock() ở trên
+        with VAS_LOCK:
             for rec in reversed(VAS_STORE):
-                # Lọc theo vùng khớp
                 if rec.get("exercise_region") != region:
                     continue
-
-                # Nếu có patient_code thì lọc đúng bệnh nhân
                 if patient_code and rec.get("patient_code") != patient_code:
                     continue
-
-                # (TUỲ CHỌN) Nếu muốn khớp cả tên bài tập:
-                # if exercise_name:
-                #     ex_rec = (rec.get("exercise_name") or "").strip().lower()
-                #     if ex_rec and ex_rec != exercise_name.lower():
-                #         continue
-
-                phase = rec.get("phase")
-                if phase == "before" and vas_before is None:
+                ph = rec.get("phase")
+                if ph == "before" and vas_before is None:
                     vas_before = rec.get("vas")
-                elif phase == "after" and vas_after is None:
+                elif ph == "after" and vas_after is None:
                     vas_after = rec.get("vas")
-
                 if vas_before is not None and vas_after is not None:
                     break
 
-    # ===== 2. LOGIC CŨ: LẤY DỮ LIỆU PHIÊN ĐO =====
-
-    # Khi chưa có phiên đo
     if not LAST_SESSION:
         return render_template_string(
             CHARTS_HTML,
             username=current_user.id,
-            t_ms=[],
-            hip=[],
-            knee=[],
-            ankle=[],
+            t_ms=[], hip=[], knee=[], ankle=[],
+            emg=[], emg_rms=[], emg_env=[],
             patient_code=patient_code,
             exercise_name=exercise_name,
-            vas_before=vas_before,
-            vas_after=vas_after,
+            vas_before=vas_before, vas_after=vas_after,
         )
 
-    rows = LAST_SESSION[:]
+    rows = list(LAST_SESSION)
     rows.sort(key=lambda x: x["t_ms"])
-
-    raw_t    = [r["t_ms"] for r in rows]
-    hipArr   = [r["hip"]   for r in rows]
-    kneeArr  = [r["knee"]  for r in rows]
-    ankleArr = [r["ankle"] for r in rows]
-
-    t0   = raw_t[0]
-    # t_ms tính theo giây từ lúc bắt đầu phiên đo
+    raw_t = [r["t_ms"] for r in rows]
+    t0 = raw_t[0] if raw_t else 0
     t_ms = [round((t - t0) / 1000.0, 3) for t in raw_t]
+
+    hipArr    = [r.get("hip", 0.0) for r in rows]
+    kneeArr   = [r.get("knee", 0.0) for r in rows]
+    ankleArr  = [r.get("ankle", 0.0) for r in rows]
+    emgArr    = [r.get("emg", 0.0) or 0.0 for r in rows]
+    emgRmsArr = [r.get("emg_rms", 0.0) or 0.0 for r in rows]
+    emgEnvArr = [r.get("emg_env", 0.0) or 0.0 for r in rows]
 
     return render_template_string(
         CHARTS_HTML,
         username=current_user.id,
-        t_ms=t_ms,
-        hip=hipArr,
-        knee=kneeArr,
-        ankle=ankleArr,
+        t_ms=t_ms, hip=hipArr, knee=kneeArr, ankle=ankleArr,
+        emg=emgArr, emg_rms=emgRmsArr, emg_env=emgEnvArr,
         patient_code=patient_code,
         exercise_name=exercise_name,
-        vas_before=vas_before,
-        vas_after=vas_after,
+        vas_before=vas_before, vas_after=vas_after,
     )
-
 
 
 
@@ -1740,7 +1626,7 @@ body.sb-collapsed .sidebar *{
 
     <main class="main-col">
       <div class="panel mb-3">
-        <h5 class="mb-1">Danh sách bệnh án điện tử</h5>
+        <h5 class="mb-1">Danh sách bệnh án</h5>
         <div class="text-muted small">
           Các bản ghi được lưu khi nhấn nút <strong>"Lưu kết quả"</strong> trên trang đo.
         </div>
@@ -1972,8 +1858,7 @@ body{
 
 
 # ======= Dashboard (sidebar ẩn, bấm ☰ để mở) =======
-DASH_HTML = """ 
-<!doctype html><html lang="vi"><head>
+DASH_HTML = """<!doctype html><html lang="vi"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>IMU Dashboard</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
@@ -1993,140 +1878,164 @@ body{ background:#fafbfe }
 .main-col{ flex:1 1 auto; min-width:0; }
 
 /* ===== CSS VAS ===== */
-.vas-wrapper {
-  padding: 16px 18px;
-  background: #ffffff;
-  border-radius: 12px;
-  box-shadow: 0 3px 10px rgba(0,0,0,0.08);
-}
-.vas-line-container {
-  position: relative;
-  width: 100%;
-}
-.vas-line {
-  height: 3px;
-  background: #0097b2;
-  margin-bottom: 26px;
-}
-.vas-ticks {
-  display: flex;
-  justify-content: space-between;
-  position: relative;
-  margin-top: -18px;
-}
-.vas-tick {
-  position: relative;
-  font-size: 14px;
-  color: #222;
-  cursor: pointer;
-  text-align: center;
-}
-.vas-tick::before {
-  content: "";
-  width: 2px;
-  height: 18px;
-  background: #0097b2;
-  display: block;
-  margin: 0 auto 4px auto;
-}
-.vas-tick.active::before {
-  background: #ff5722;
-  height: 24px;
-}
-.vas-tick.active {
-  color: #ff5722;
-  font-weight: 600;
-}
-.vas-labels {
-  display: flex;
-  justify-content: space-between;
-  margin-top: 24px;
-  font-size: 11px;
-  color: #444;
-  text-align: center;
-}
-.vas-labels span small {
-  font-size: 10px;
-}
+.vas-wrapper { padding: 16px 18px; background: #ffffff; border-radius: 12px; box-shadow: 0 3px 10px rgba(0,0,0,0.08); }
+.vas-line-container { position: relative; width: 100%; }
+.vas-line { height: 3px; background: #0097b2; margin-bottom: 26px; }
+.vas-ticks { display: flex; justify-content: space-between; position: relative; margin-top: -18px; }
+.vas-tick { position: relative; font-size: 14px; color: #222; cursor: pointer; text-align: center; }
+.vas-tick::before { content: ""; width: 2px; height: 18px; background: #0097b2; display: block; margin: 0 auto 4px auto; }
+.vas-tick.active::before { background: #ff5722; height: 24px; }
+.vas-tick.active { color: #ff5722; font-weight: 600; }
+.vas-labels { display: flex; justify-content: space-between; margin-top: 24px; font-size: 11px; color: #444; text-align: center; }
+.vas-labels span small { font-size: 10px; }
 
 /* Thu gọn mặc định */
 .sb-collapsed .sidebar-col{ flex-basis:0; max-width:0; transform:translateX(-8px); }
 .sb-collapsed .sidebar{ padding:0; width:0; border-radius:0; }
 .sb-collapsed .sidebar *{ display:none; }
 
-.panel{
-  background:#fff;
-  border-radius:16px;
-  box-shadow:0 8px 20px rgba(16,24,40,.06);
-  padding:16px;overflow:hidden;
-}
-.title-chip{
-  display:inline-block;
-  background:#e6f2ff;
-  border:2px solid #9ccaff;
-  color:#073c74;
-  padding:8px 14px;
-  border-radius:14px;
-  font-weight:800;
-}
+.panel{ background:#fff; border-radius:16px; box-shadow:0 8px 20px rgba(16,24,40,.06); padding:16px;overflow:hidden; }
+.title-chip{ display:inline-block; background:#e6f2ff; border:2px solid #9ccaff; color:#073c74; padding:8px 14px; border-radius:14px; font-weight:800; }
 .table thead th{ background:#eef5ff; color:#083a6a }
-.btn-outline-thick{
-  border:2px solid #151515;
-  border-radius:12px;
-  background:#fff;
-  font-weight:700;
-}
+.btn-outline-thick{ border:2px solid #151515; border-radius:12px; background:#fff; font-weight:700; }
 .form-label{ font-weight:600; color:#244e78 }
-.compact .row.g-3{
-  --bs-gutter-x:1rem;
-  --bs-gutter-y:1rem;
-}
-.compact .btn-outline-thick{
-  padding:10px 12px;
-  border-radius:10px;
-}
-#guideVideo{
-  height:var(--video-h);
-  border-radius:14px;
-  background:#000;
-}
-@media (min-width:1400px){
-  :root{ --video-h:400px; }
-}
-@media (min-width:992px){
-  .pull-up-guide{
-    margin-top: calc(-1 * var(--video-h) - 16px);
-  }
-}
-#btnToggleSB{
-  border:2px solid #d8e6ff;
-  border-radius:10px;
-  background:#fff;
-  padding:6px 10px;
-  font-weight:700;
-}
+.compact .row.g-3{ --bs-gutter-x:1rem; --bs-gutter-y:1rem; }
+.compact .btn-outline-thick{ padding:10px 12px; border-radius:10px; }
+#guideVideo{ height:var(--video-h); border-radius:14px; background:#000; }
+@media (min-width:1400px){ :root{ --video-h:400px; } }
+@media (min-width:992px){ .pull-up-guide{ margin-top:-318px !important; } }
+
+#btnToggleSB{ border:2px solid #d8e6ff; border-radius:10px; background:#fff; padding:6px 10px; font-weight:700; }
 #btnToggleSB:hover{ background:#f4f8ff; }
 
-.menu-btn{
-  width:100%;
-  display:block;
-  background:#1973d4;
-  border:none;
-  color:#fff;
-  padding:10px 12px;
-  margin:8px 0;
-  border-radius:12px;
-  font-weight:600;
-  text-align:left;
-  text-decoration:none;
-}
-.menu-btn:hover{
-  background:#1f80ea;
-  color:#fff
-}
+.menu-btn{ width:100%; display:block; background:#1973d4; border:none; color:#fff; padding:10px 12px; margin:8px 0; border-radius:12px; font-weight:600; text-align:left; text-decoration:none; }
+.menu-btn:hover{ background:#1f80ea; color:#fff }
 
 /* nền khung three: xanh nhạt; muốn trắng đổi thành #ffffff */
 #threeMount{ background:#eaf2ff; }
+
+/* ===================== EMG UI (đẹp + dễ quan sát) ===================== */
+.emg-card{
+  background: linear-gradient(180deg, #ffffff 0%, #fbfdff 100%);
+  border: 1px solid #e6eefc;
+  border-radius: 16px;
+  padding: 14px 14px 12px;
+  box-shadow: 0 10px 24px rgba(16,24,40,.06);
+}
+.emg-hr{ width:210px; }
+.emg-hr .input-group-text,
+.emg-hr .form-control{
+  border-color:#dbe7ff;
+  font-weight:800;
+}
+.emg-hr .form-control{ text-align:center; }
+
+.emg-head{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  margin-bottom:10px;
+}
+.emg-title{
+  display:flex;
+  align-items:center;
+  gap:10px;
+}
+.emg-dot{
+  width:10px;height:10px;border-radius:50%;
+  background:#20c997;
+  box-shadow:0 0 0 6px rgba(32,201,151,.14);
+}
+.emg-title .title-chip{ margin:0; }
+.emg-meta{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  flex-wrap:wrap;
+  justify-content:flex-end;
+}
+.emg-pill{
+  border:1px solid #dde7fb;
+  background:#f7fbff;
+  border-radius:999px;
+  padding:6px 10px;
+  font-weight:700;
+  font-size:12px;
+  color:#0b2d52;
+  line-height:1;
+  white-space:nowrap;
+}
+.emg-pill strong{ font-size:13px; }
+.emg-rms{
+  border:1px solid #cfe6ff;
+  background:#eaf4ff;
+  color:#073c74;
+}
+.emg-rms strong{ font-size:14px; }
+
+.emg-plot{
+  position:relative;
+  height:210px;
+  border-radius:14px;
+  overflow:hidden;
+  border:1px solid #e6eefc;
+  background:
+    linear-gradient(180deg, rgba(22,105,201,.08) 0%, rgba(22,105,201,0) 55%),
+    repeating-linear-gradient(0deg, rgba(8,58,106,.07) 0, rgba(8,58,106,.07) 1px, transparent 1px, transparent 28px),
+    repeating-linear-gradient(90deg, rgba(8,58,106,.05) 0, rgba(8,58,106,.05) 1px, transparent 1px, transparent 48px),
+    #ffffff;
+}
+.emg-plot:before{
+  content:"µV";
+  position:absolute;
+  top:10px; left:12px;
+  font-size:12px;
+  font-weight:800;
+  color:#0b2d52;
+  opacity:.75;
+  padding:2px 8px;
+  border-radius:999px;
+  background:#f3f8ff;
+  border:1px solid #e2ecff;
+  z-index:2;
+}
+#emgChart{ width:100%; height:100%; display:block; }
+
+.emg-controls{
+  margin-top:10px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  flex-wrap:wrap;
+}
+.emg-controls .input-group .input-group-text{
+  font-weight:800;
+  background:#f3f8ff;
+  border-color:#dbe7ff;
+  color:#073c74;
+}
+.emg-controls .form-select,
+.emg-controls .form-control{
+  border-color:#dbe7ff;
+  font-weight:700;
+}
+.emg-hint{
+  margin-top:8px;
+  color:#5b6b7c;
+  font-size:12px;
+}
+
+/* Mobile: plot cao hơn chút */
+@media (max-width:576px){
+  .emg-plot{ height:260px; }
+}
+
+#status3D{ display:none; }
+
+/* Khi không phải knee -> ẩn card EMG */
+.emg-hidden{ display:none !important; }
 </style>
 </head>
 
@@ -2147,43 +2056,72 @@ body{ background:#fafbfe }
     <aside class="sidebar-col">
       <div class="sidebar">
         <div class="mb-2 fw-bold" data-i18n="menu.title">MENU</div>
-        <a class="menu-btn" href="/"                data-i18n="menu.home">Trang chủ</a>
-        <a class="menu-btn" href="/calibration"     data-i18n="menu.calib">Hiệu chuẩn</a>
+        <a class="menu-btn" href="/" data-i18n="menu.home">Trang chủ</a>
+        <a class="menu-btn" href="/calibration" data-i18n="menu.calib">Hiệu chuẩn</a>
         <a class="menu-btn" href="/patients/manage" data-i18n="menu.patinfo">Thông tin bệnh nhân</a>
-        <a class="menu-btn" href="/patients"        data-i18n="menu.review">Xem lại</a>
-        <a class="menu-btn" href="/records"         data-i18n="menu.record">Bệnh án</a>
-        <a class="menu-btn" href="/charts"          data-i18n="menu.charts">Biểu đồ</a>
-        <a class="menu-btn" href="/settings"        data-i18n="menu.settings">Cài đặt</a>
+        <a class="menu-btn" href="/patients" data-i18n="menu.review">Xem lại</a>
+        <a class="menu-btn" href="/records" data-i18n="menu.record">Bệnh án</a>
+        <a class="menu-btn" href="/charts" data-i18n="menu.charts">Biểu đồ</a>
+        <a class="menu-btn" href="/settings" data-i18n="menu.settings">Cài đặt</a>
       </div>
     </aside>
 
     <!-- Main -->
     <main class="main-col">
       <div class="row g-3">
+
         <div class="col-lg-7">
           <div class="panel mb-3">
             <div class="d-flex gap-2">
-              <!-- Nút này được JS bắt sự kiện để mở modal -->
               <a class="btn btn-outline-thick flex-fill" href="#" id="btnPatientList" data-i18n="dash.patient_list">Danh sách bệnh nhân</a>
               <a class="btn btn-outline-thick flex-fill" href="/patients/new" data-i18n="dash.add_patient">Thêm bệnh nhân mới</a>
             </div>
-            <div class="mt-3 d-flex align-items-center gap-3">
-              <label class="form-label mb-0" data-i18n="dash.heart_label">Nhịp tim :</label>
-              <input class="form-control" id="heartRate" style="max-width:180px">
-              <span class="badge text-bg-light border" data-i18n="dash.heart_unit">bpm</span>
-            </div>
-            <div class="mt-3 panel">
-              <div class="table-responsive">
-                <table class="table table-sm align-middle">
-                  <thead>
-                    <tr>
-                      <th data-i18n="dash.hip">Hip</th>
-                      <th data-i18n="dash.knee">Knee</th>
-                      <th data-i18n="dash.ankle">Ankle</th>
-                    </tr>
-                  </thead>
-                  <tbody id="tblAngles"><tr><td>--</td><td>--</td><td>--</td></tr></tbody>
-                </table>
+
+            <!-- ✅ EMG WAVEFORM (chỉ hiện khi chọn KNEE) -->
+            <div class="mt-3 emg-card" id="emgCard">
+              <div class="emg-head">
+                <div class="emg-title">
+                  <span class="emg-dot" title="Live"></span>
+                  <span class="title-chip" data-i18n="dash.emg_title">EMG</span>
+                </div>
+                <div class="emg-meta">
+                  <div class="input-group input-group-sm emg-hr">
+                    <span class="input-group-text" data-i18n="dash.heart_label">Nhịp tim :</span>
+                    <input class="form-control" id="heartRate" inputmode="numeric" placeholder="--">
+                    <span class="input-group-text" data-i18n="dash.heart_unit">bpm</span>
+                  </div>
+
+                  <span class="emg-pill">Sensor <strong>5</strong> (Knee)</span>
+                  <span class="emg-pill">Scale <strong id="emgScaleTxt">±1000</strong> µV</span>
+                  <span class="emg-pill">Window <strong id="emgWinTxt">5</strong>s</span>
+                  <span class="emg-pill emg-rms">RMS <strong id="emgRmsTxt">--</strong> µV</span>
+                </div>
+
+              </div>
+
+              <div class="emg-plot">
+                <canvas id="emgChart"></canvas>
+              </div>
+
+              <div class="emg-controls">
+                <div class="input-group" style="max-width:260px;">
+                  <span class="input-group-text">Kênh</span>
+                  <select class="form-select" id="emgChannelSel" disabled>
+                    <option value="emg" selected>emg (sensor 5)</option>
+                  </select>
+                </div>
+
+                <div class="input-group" style="max-width:220px;">
+                  <span class="input-group-text" data-i18n="emg.window">Window</span>
+                  <input class="form-control" id="emgWin" type="number" min="1" max="20" step="1" value="5">
+                  <span class="input-group-text" data-i18n="unit.second">s</span>
+                </div>
+
+                <div class="input-group" style="max-width:240px;">
+                  <span class="input-group-text">Scale ±</span>
+                  <input class="form-control" id="emgScale" type="number" min="50" max="20000" step="50" value="1000">
+                  <span class="input-group-text">µV</span>
+                </div>
               </div>
             </div>
           </div>
@@ -2216,9 +2154,9 @@ body{ background:#fafbfe }
                 <label class="form-label" data-i18n="pat.height">Chiều cao :</label>
                 <input id="pat_height" class="form-control">
               </div>
+
               <input type="hidden" id="pat_code">
 
-              <!-- BÀI KIỂM TRA + NGÀY ĐO -->
               <div class="col-8">
                 <label class="form-label" data-i18n="pat.exercise">Bài kiểm tra :</label>
                 <div class="input-group">
@@ -2249,18 +2187,18 @@ body{ background:#fafbfe }
               <span class="title-chip" data-i18n="dash.3d_title">MÔ PHỎNG 3D</span>
               <div class="small text-muted" data-i18n="dash.3d_source">Nguồn: hip/knee/ankle từ IMU (độ)</div>
             </div>
-            <div id="threeMount" style="width:100%; height:480px; min-height:480px; border-radius:14px; overflow:visible; position:relative; z-index:1;">
-            </div>
+
+            <div id="threeMount" style="width:100%; height:480px; min-height:480px; border-radius:14px; overflow:visible; position:relative; z-index:1;"></div>
+
             <div class="text-center mt-2">
               <span class="badge text-bg-light border me-2">Hip: <span id="liveHip">--</span>°</span>
               <span class="badge text-bg-light border me-2">Knee: <span id="liveKnee">--</span>°</span>
               <span class="badge text-bg-light border">Ankle: <span id="liveAnkle">--</span>°</span>
             </div>
+
             <div class="mt-3 text-center">
               <button class="btn btn-outline-thick px-4 py-2" id="btnResetPose3D" data-i18n="dash.reset3d">Reset 3D</button>
-              <div class="small text-muted mt-2" id="status3D">
-                Đang khởi tạo 3D…
-              </div>
+              <div class="small text-muted mt-2" id="status3D"> Đang khởi tạo 3D… </div>
             </div>
           </div>
         </div>
@@ -2272,7 +2210,6 @@ body{ background:#fafbfe }
             <button class="btn btn-outline-thick py-3" id="btnStop" data-i18n="dash.stop_measure">Kết thúc đo</button>
             <button class="btn btn-outline-thick py-3" id="btnSave" data-i18n="dash.save_result">Lưu kết quả</button>
 
-            <!-- Kết quả bài hiện tại (hiện tại không dùng nữa, để sẵn nếu sau này cần) -->
             <div id="exercise-result-panel" class="mt-3" style="display:none;">
               <h6 id="exercise-title-text" class="fw-bold mb-2"></h6>
               <div style="height:160px;">
@@ -2288,13 +2225,10 @@ body{ background:#fafbfe }
                 </div>
               </div>
               <div class="mt-3 d-flex gap-2">
-                <button id="btn-next-ex" class="btn btn-outline-thick flex-grow-1" data-i18n="dash.next_ex">
-                  Bài tập tiếp theo
-                </button>
+                <button id="btn-next-ex" class="btn btn-outline-thick flex-grow-1" data-i18n="dash.next_ex"> Bài tập tiếp theo </button>
               </div>
             </div>
 
-            <!-- Tổng kết tất cả bài (hiện tại không dùng nữa, sẽ tổng hợp ở tab Biểu đồ) -->
             <div id="all-exercise-summary" class="mt-3" style="display:none;">
               <h6 class="fw-bold" data-i18n="dash.summary_all">Tổng kết tất cả bài tập</h6>
               <ul class="small mb-2" id="summary-list"></ul>
@@ -2303,6 +2237,7 @@ body{ background:#fafbfe }
                 <span id="total-score-text">0</span>
               </div>
             </div>
+
           </div>
         </div>
 
@@ -2355,28 +2290,23 @@ body{ background:#fafbfe }
           Vui lòng chọn mức độ đau từ 0 (không đau) đến 10 (đau tệ nhất).
         </p>
 
-        <!-- THANG ĐO VAS TIẾNG VIỆT -->
         <div class="vas-wrapper">
           <div class="vas-line-container">
-            <!-- Đường ngang -->
             <div class="vas-line"></div>
-
-            <!-- Các mốc 0–10 -->
             <div class="vas-ticks">
-              <div class="vas-tick" data-value="0"  onclick="selectVASTick(0)">0</div>
-              <div class="vas-tick" data-value="1"  onclick="selectVASTick(1)">1</div>
-              <div class="vas-tick" data-value="2"  onclick="selectVASTick(2)">2</div>
-              <div class="vas-tick" data-value="3"  onclick="selectVASTick(3)">3</div>
-              <div class="vas-tick" data-value="4"  onclick="selectVASTick(4)">4</div>
-              <div class="vas-tick" data-value="5"  onclick="selectVASTick(5)">5</div>
-              <div class="vas-tick" data-value="6"  onclick="selectVASTick(6)">6</div>
-              <div class="vas-tick" data-value="7"  onclick="selectVASTick(7)">7</div>
-              <div class="vas-tick" data-value="8"  onclick="selectVASTick(8)">8</div>
-              <div class="vas-tick" data-value="9"  onclick="selectVASTick(9)">9</div>
+              <div class="vas-tick" data-value="0" onclick="selectVASTick(0)">0</div>
+              <div class="vas-tick" data-value="1" onclick="selectVASTick(1)">1</div>
+              <div class="vas-tick" data-value="2" onclick="selectVASTick(2)">2</div>
+              <div class="vas-tick" data-value="3" onclick="selectVASTick(3)">3</div>
+              <div class="vas-tick" data-value="4" onclick="selectVASTick(4)">4</div>
+              <div class="vas-tick" data-value="5" onclick="selectVASTick(5)">5</div>
+              <div class="vas-tick" data-value="6" onclick="selectVASTick(6)">6</div>
+              <div class="vas-tick" data-value="7" onclick="selectVASTick(7)">7</div>
+              <div class="vas-tick" data-value="8" onclick="selectVASTick(8)">8</div>
+              <div class="vas-tick" data-value="9" onclick="selectVASTick(9)">9</div>
               <div class="vas-tick" data-value="10" onclick="selectVASTick(10)">10</div>
             </div>
 
-            <!-- Nhãn nhóm mô tả -->
             <div class="vas-labels">
               <span>0<br><small>Không đau</small></span>
               <span>1–2<br><small>Đau rất nhẹ</small></span>
@@ -2396,15 +2326,12 @@ body{ background:#fafbfe }
 
       <div class="modal-footer">
         <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Hủy</button>
-        <button type="button" class="btn btn-primary" id="vasConfirmBtn">
-          Xác nhận mức đau
-        </button>
+        <button type="button" class="btn btn-primary" id="vasConfirmBtn"> Xác nhận mức đau </button>
       </div>
     </div>
   </div>
 </div>
 
-<!-- Bootstrap JS (để dùng Modal) -->
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 
 <!-- ===== SIMPLE I18N (VI / EN) ===== -->
@@ -2419,20 +2346,24 @@ const I18N = {
     "menu.record": "Bệnh án",
     "menu.charts": "Biểu đồ",
     "menu.settings": "Cài đặt",
+    "emg.window": "Cửa sổ",
+    "unit.second": "s",
 
     "dash.patient_list": "Danh sách bệnh nhân",
     "dash.add_patient": "Thêm bệnh nhân mới",
     "dash.heart_label": "Nhịp tim :",
     "dash.heart_unit": "bpm",
-    "dash.hip": "Hip",
-    "dash.knee": "Knee",
-    "dash.ankle": "Ankle",
+
+    "dash.emg_title": "EMG",
+
     "dash.3d_title": "MÔ PHỎNG 3D",
     "dash.3d_source": "Nguồn: hip/knee/ankle từ IMU (độ)",
     "dash.reset3d": "Reset 3D",
+
     "dash.start_measure": "Bắt đầu đo",
     "dash.stop_measure": "Kết thúc đo",
     "dash.save_result": "Lưu kết quả",
+
     "dash.rom_hip": "ROM Hip:",
     "dash.rom_knee": "ROM Knee:",
     "dash.rom_ankle": "ROM Ankle:",
@@ -2460,7 +2391,6 @@ const I18N = {
     "pat.th_gender": "Giới tính",
     "pat.modal_hint": "Nhấp đúp vào 1 dòng để chọn bệnh nhân."
   },
-
   en: {
     "menu.title": "MENU",
     "menu.home": "Home",
@@ -2470,20 +2400,24 @@ const I18N = {
     "menu.record": "Medical record",
     "menu.charts": "Charts",
     "menu.settings": "Settings",
+    "emg.window": "Window",
+    "unit.second": "s",
 
     "dash.patient_list": "Patient list",
     "dash.add_patient": "Add new patient",
     "dash.heart_label": "Heart rate:",
     "dash.heart_unit": "bpm",
-    "dash.hip": "Hip",
-    "dash.knee": "Knee",
-    "dash.ankle": "Ankle",
+
+    "dash.emg_title": "EMG",
+
     "dash.3d_title": "3D Simulation",
     "dash.3d_source": "Source: hip/knee/ankle from IMU (deg)",
     "dash.reset3d": "Reset 3D",
+
     "dash.start_measure": "Start measurement",
     "dash.stop_measure": "Stop measurement",
     "dash.save_result": "Save results",
+
     "dash.rom_hip": "ROM Hip:",
     "dash.rom_knee": "ROM Knee:",
     "dash.rom_ankle": "ROM Ankle:",
@@ -2515,16 +2449,12 @@ const I18N = {
 
 function applyLanguage(lang){
   const dict = I18N[lang] || I18N.vi;
-
-  // innerText
   document.querySelectorAll("[data-i18n]").forEach(el => {
     const key = el.getAttribute("data-i18n");
     const txt = dict[key];
     if (!txt) return;
     el.textContent = txt;
   });
-
-  // placeholder
   document.querySelectorAll("[data-i18n-placeholder]").forEach(el => {
     const key = el.getAttribute("data-i18n-placeholder");
     const txt = dict[key];
@@ -2534,7 +2464,7 @@ function applyLanguage(lang){
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-  const lang = localStorage.getItem("appLang") || "vi";   // lấy từ trang Cài đặt
+  const lang = localStorage.getItem("appLang") || "vi";
   applyLanguage(lang);
 });
 </script>
@@ -2545,7 +2475,7 @@ const videosMap = {{ videos|tojson }};
 const videoKeys = Object.keys(videosMap || {});
 const sel = document.getElementById('exerciseSelect');
 const vid = document.getElementById('guideVideo');
-// đưa ra global để script sau dùng
+
 window.videosMap = videosMap;
 window.EXERCISE_KEYS = videoKeys;
 window.currentExerciseIndex = 0;
@@ -2558,13 +2488,8 @@ if (btnAddExercise && sel) {
     const key = name.trim();
     if (!key) return;
 
-    const exists = (window.EXERCISE_KEYS || []).some(
-      k => k.toLowerCase() === key.toLowerCase()
-    );
-    if (exists) {
-      alert('Bài tập này đã có trong danh sách.');
-      return;
-    }
+    const exists = (window.EXERCISE_KEYS || []).some(k => k.toLowerCase() === key.toLowerCase());
+    if (exists) { alert('Bài tập này đã có trong danh sách.'); return; }
 
     const opt = document.createElement('option');
     opt.value = key;
@@ -2576,9 +2501,7 @@ if (btnAddExercise && sel) {
     sel.value = key;
     window.currentExerciseIndex = window.EXERCISE_KEYS.length - 1;
 
-    if (typeof window.updateVideo === 'function') {
-      window.updateVideo(key);
-    }
+    if (typeof window.updateVideo === 'function') window.updateVideo(key);
   });
 }
 
@@ -2609,10 +2532,8 @@ window.updateVideo = function(forceKey){
 if (sel){
   sel.addEventListener('change', () => window.updateVideo(sel.value));
 }
-// gọi lần đầu
 window.updateVideo();
 
-// Toggle sidebar
 document.getElementById('btnToggleSB').addEventListener('click', ()=>{
   document.body.classList.toggle('sb-collapsed');
 });
@@ -2621,34 +2542,29 @@ document.getElementById('btnToggleSB').addEventListener('click', ()=>{
 let PAT_CACHE = null;
 
 function fillPatientOnDashboard(rec){
-  const name   = rec.name   || "";
-  const cccd   = rec.ID     || "";
-  const dob    = rec.DateOfBirth || "";
+  const name = rec.name || "";
+  const cccd = rec.ID || "";
+  const dob = rec.DateOfBirth || "";
   const gender = rec.Gender || "";
   const weight = rec.Weight || "";
   const height = rec.Height || "";
-  const code   = rec.PatientCode || rec.Patientcode || "";
+  const code = rec.PatientCode || rec.Patientcode || "";
 
-  document.getElementById('pat_name').value   = name;
-  document.getElementById('pat_cccd').value   = cccd;
-  document.getElementById('pat_dob').value    = dob;
+  document.getElementById('pat_name').value = name;
+  document.getElementById('pat_cccd').value = cccd;
+  document.getElementById('pat_dob').value = dob;
   document.getElementById('pat_gender').value = gender;
   document.getElementById('pat_weight').value = weight;
   document.getElementById('pat_height').value = height;
+
   const codeInput = document.getElementById('pat_code');
   if (codeInput) codeInput.value = code;
 
-  // Lưu bệnh nhân hiện tại vào localStorage
   try{
-    localStorage.setItem("currentPatient", JSON.stringify({
-      code, name, cccd, dob, gender, weight, height
-    }));
-  }catch(e){
-    console.warn("Không lưu được currentPatient:", e);
-  }
+    localStorage.setItem("currentPatient", JSON.stringify({ code, name, cccd, dob, gender, weight, height }));
+  }catch(e){ console.warn("Không lưu được currentPatient:", e); }
 }
 
-/* ===== MỚI: load lại bệnh nhân hiện tại từ localStorage khi vào trang ===== */
 function loadCurrentPatientFromLocalStorage(){
   try{
     const raw = localStorage.getItem("currentPatient");
@@ -2656,17 +2572,16 @@ function loadCurrentPatientFromLocalStorage(){
     const p = JSON.parse(raw);
     if (!p) return;
 
-    document.getElementById('pat_name').value   = p.name   || "";
-    document.getElementById('pat_cccd').value   = p.cccd   || "";
-    document.getElementById('pat_dob').value    = p.dob    || "";
+    document.getElementById('pat_name').value = p.name || "";
+    document.getElementById('pat_cccd').value = p.cccd || "";
+    document.getElementById('pat_dob').value = p.dob || "";
     document.getElementById('pat_gender').value = p.gender || "";
     document.getElementById('pat_weight').value = p.weight || "";
     document.getElementById('pat_height').value = p.height || "";
+
     const codeInput = document.getElementById('pat_code');
     if (codeInput) codeInput.value = p.code || "";
-  }catch(e){
-    console.warn("Không đọc được currentPatient từ localStorage:", e);
-  }
+  }catch(e){ console.warn("Không đọc được currentPatient từ localStorage:", e); }
 }
 
 function renderPatRows(rows){
@@ -2710,7 +2625,6 @@ document.getElementById('btnPatientList').addEventListener('click', async (e)=>{
   modal.show();
 });
 
-// search trong modal
 document.getElementById('pm_search').addEventListener('input', (e)=>{
   const kw = e.target.value.toLowerCase();
   const trs = document.querySelectorAll('#pm_body tr');
@@ -2721,7 +2635,6 @@ document.getElementById('pm_search').addEventListener('input', (e)=>{
 </script>
 
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
-<!-- Chart.js để vẽ biểu đồ từng bài (nếu sau này dùng panel kết quả tại chỗ) -->
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
 <script type="module">
@@ -2730,18 +2643,15 @@ window.THREE = THREE;
 import { GLTFLoader } from 'https://unpkg.com/three@0.154.0/examples/jsm/loaders/GLTFLoader.js';
 import { OrbitControls } from 'https://unpkg.com/three@0.154.0/examples/jsm/controls/OrbitControls.js';
 
-const mount    = document.getElementById('threeMount');
+const mount = document.getElementById('threeMount');
 const statusEl = document.getElementById('status3D');
 
-// Scene
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0xeaf2ff);
 
-// Camera
 const camera = new THREE.PerspectiveCamera(55, 1, 0.1, 5000);
 camera.position.set(0, 120, 260);
 
-// Renderer
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(mount.clientWidth, mount.clientHeight);
@@ -2753,25 +2663,21 @@ renderer.domElement.style.width = "100%";
 renderer.domElement.style.height = "100%";
 renderer.domElement.style.display = "block";
 
-// Lights
 scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.3));
 const dir = new THREE.DirectionalLight(0xffffff, 1.1);
 dir.position.set(2, 4, 2);
 scene.add(dir);
 
-// Controls
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.enablePan = false;
 controls.enableRotate = false;
 
-// Grid
 const GRID_SIZE = 240;
 const grid = new THREE.GridHelper(GRID_SIZE, 24, 0x999999, 0xcccccc);
 grid.position.y = 0;
 scene.add(grid);
 
-// Resize
 function resizeNow() {
   const w = mount.clientWidth || 1;
   const h = mount.clientHeight || 1;
@@ -2783,13 +2689,11 @@ new ResizeObserver(resizeNow).observe(mount);
 window.addEventListener('resize', resizeNow);
 resizeNow();
 
-// Pivot
 const legPivot = new THREE.Group();
 legPivot.position.set(0, 0, 0);
 scene.add(legPivot);
 window.legPivot = legPivot;
 
-// Load GLB
 const loader = new GLTFLoader();
 const GLB_URL = "{{ url_for('static', filename='models/leg_model.glb') }}";
 
@@ -2797,12 +2701,8 @@ loader.load(
   GLB_URL,
   (gltf) => {
     const model = gltf.scene || gltf.scenes?.[0];
-    if (!model) {
-      statusEl.textContent = "⚠️ GLB không có scene.";
-      return;
-    }
+    if (!model) { statusEl.textContent = "⚠️ GLB không có scene."; return; }
 
-    // Ẩn mesh tĩnh, chỉ giữ SkinnedMesh
     window.SKINS = [];
     model.traverse((o) => {
       if (o.isSkinnedMesh) {
@@ -2814,7 +2714,6 @@ loader.load(
       }
     });
 
-    // Chuẩn hoá pose rồi bind lại
     model.rotation.set(0, 0, 0);
     model.scale.set(1, 1, 1);
     model.updateMatrixWorld(true);
@@ -2829,12 +2728,9 @@ loader.load(
     legPivot.add(model);
     legPivot.rotation.y = Math.PI;
 
-    // Fit vào khung & đặt chạm sàn
     const box0 = new THREE.Box3().setFromObject(model);
-    const size0 = new THREE.Vector3();
-    box0.getSize(size0);
-    const center0 = new THREE.Vector3();
-    box0.getCenter(center0);
+    const size0 = new THREE.Vector3(); box0.getSize(size0);
+    const center0 = new THREE.Vector3(); box0.getCenter(center0);
     model.position.sub(center0);
     model.updateMatrixWorld(true);
 
@@ -2854,7 +2750,6 @@ loader.load(
     model.position.z -= c2.z;
     model.updateMatrixWorld(true);
 
-    // Camera side-view
     const sphere = new THREE.Sphere();
     new THREE.Box3().setFromObject(model).getBoundingSphere(sphere);
     const sideDist = sphere.radius * 2.2;
@@ -2865,8 +2760,7 @@ loader.load(
     controls.minDistance = sphere.radius * 0.8;
     controls.maxDistance = sphere.radius * 3.0;
 
-    /* ====== ĐA-SKELETON: gom mọi bone trùng tên ====== */
-    const BONE_REG = new Map(); // name(lowercase) -> array of Bone
+    const BONE_REG = new Map();
     for (const sm of window.SKINS) {
       for (const b of sm.skeleton.bones) {
         const key = (b.name || '').toLowerCase();
@@ -2883,33 +2777,17 @@ loader.load(
       return BONE_REG.get(key) || [];
     }
 
-    const AXISVEC = {
-      x:new THREE.Vector3(1,0,0),
-      y:new THREE.Vector3(0,1,0),
-      z:new THREE.Vector3(0,0,1)
-    };
-    const AXIS =  { hip:'x', knee:'x', ankle:'x' };
-    const SIGN =  { hip:-1, knee: 1, ankle: 1 };
-    const OFF  =  { hip: 0, knee: 0, ankle:-90 };
+    const AXISVEC = { x:new THREE.Vector3(1,0,0), y:new THREE.Vector3(0,1,0), z:new THREE.Vector3(0,0,1) };
+    const AXIS = { hip:'x', knee:'x', ankle:'x' };
+    const SIGN = { hip:-1, knee: 1, ankle: 1 };
+    const OFF  = { hip: 0, knee: 0, ankle:-90 };
     const toRad = d => (Number(d)||0) * Math.PI/180;
-
-    window.setAxis = (joint, axis, sign=1)=>{
-      AXIS[joint]=axis;
-      SIGN[joint]=Math.sign(sign)||1;
-    };
-    window.setOffset = (joint, deg)=>{
-      OFF[joint]=Number(deg)||0;
-    };
-    window.dumpBones = ()=> Array.from(BONE_REG.keys());
 
     function setJointDeg(joint, deg){
       const bones = getBones(joint);
       if (!bones.length) return;
       const ax = AXISVEC[AXIS[joint]] || AXISVEC.x;
-      const qDelta = new THREE.Quaternion().setFromAxisAngle(
-        ax,
-        SIGN[joint]*toRad((OFF[joint]||0) + (Number(deg)||0))
-      );
+      const qDelta = new THREE.Quaternion().setFromAxisAngle(ax, SIGN[joint]*toRad((OFF[joint]||0) + (Number(deg)||0)));
       for (const b of bones) {
         const q0 = b.userData.bindQ || b.quaternion;
         b.quaternion.copy(q0).multiply(qDelta);
@@ -2917,8 +2795,8 @@ loader.load(
     }
 
     window.applyLegAngles = (hip, knee, ankle_real) => {
-      setJointDeg('hip',   hip);
-      setJointDeg('knee',  knee);
+      setJointDeg('hip', hip);
+      setJointDeg('knee', knee);
       setJointDeg('ankle', ankle_real);
     };
 
@@ -2929,11 +2807,8 @@ loader.load(
       window.applyLegAngles(a.hip, a.knee, a.ankle);
     }
 
-    // Reset 3D
     document.getElementById('btnResetPose3D')?.addEventListener('click', () => {
-      for (const arr of BONE_REG.values())
-        for (const b of arr)
-          if (b.userData.bindQ) b.quaternion.copy(b.userData.bindQ);
+      for (const arr of BONE_REG.values()) for (const b of arr) if (b.userData.bindQ) b.quaternion.copy(b.userData.bindQ);
     });
 
     const bbox = new THREE.Box3().setFromObject(model);
@@ -2942,15 +2817,12 @@ loader.load(
     camera.near = Math.max(0.1, rad * 0.01);
     camera.far  = rad * 20;
     camera.updateProjectionMatrix();
-
   },
   (progress) => {
     const percent = (progress.loaded / (progress.total || 1)) * 100;
     statusEl.textContent = `Đang tải mô hình: ${percent.toFixed(0)}%`;
   },
-  (err) => {
-    console.error("❌ Lỗi load GLB:", err);
-  }
+  (err) => { console.error("❌ Lỗi load GLB:", err); }
 );
 
 function animate() {
@@ -2971,13 +2843,14 @@ window.pushAngles = (hip, knee, ankle) => {
 
 <!-- Socket & Start/Stop + VAS -->
 <script id="imu-handlers">
-const btnSave   = document.getElementById("btnSave");
-const btnStart  = document.getElementById("btnStart");
-const btnStop   = document.getElementById("btnStop");
+const btnSave = document.getElementById("btnSave");
+const btnStart = document.getElementById("btnStart");
+const btnStop  = document.getElementById("btnStop");
 const exerciseSelect = document.getElementById("exerciseSelect");
-const resultPanel  = document.getElementById("exercise-result-panel");
+const resultPanel = document.getElementById("exercise-result-panel");
 const summaryPanel = document.getElementById("all-exercise-summary");
-const btnNextEx    = document.getElementById("btn-next-ex");
+const btnNextEx = document.getElementById("btn-next-ex");
+
 if (btnStop) btnStop.disabled = true;
 
 // ===== GIẢ LẬP NHỊP TIM – chỉ chạy khi đang đo =====
@@ -2988,26 +2861,23 @@ let heartDir = 1;
 function startHeartSim(){
   const el = document.getElementById("heartRate");
   if (!el) return;
-  if (heartSimTimer) return; // đang chạy rồi
+  if (heartSimTimer) return;
+
   const MIN = 70;
   const MAX = 95;
+
   function step(){
     if (!isMeasuring){
       heartSimTimer = null;
       return;
     }
     heartVal += heartDir * (Math.random() * 1.5 + 0.5);
-    if (heartVal >= MAX){
-      heartVal = MAX;
-      heartDir = -1;
-    }
-    if (heartVal <= MIN){
-      heartVal = MIN;
-      heartDir = 1;
-    }
+    if (heartVal >= MAX){ heartVal = MAX; heartDir = -1; }
+    if (heartVal <= MIN){ heartVal = MIN; heartDir = 1; }
     el.value = heartVal.toFixed(0);
     heartSimTimer = setTimeout(step, Math.random()*400 + 300);
   }
+
   heartVal = 75;
   heartDir = 1;
   step();
@@ -3036,27 +2906,219 @@ const EXERCISE_ORDER = (window.EXERCISE_KEYS && window.EXERCISE_KEYS.length)
 
 let isMeasuring = false;
 let currentSamples = []; // {hip,knee,ankle}
-let exerciseResults = {}; // name -> {romHip,romKnee,romAnkle,score,samples}
-let exerciseChart = null;
 
 function getCurrentExerciseName(){
   return exerciseSelect ? (exerciseSelect.value || "exercise") : "exercise";
 }
-function getExerciseIndex(name){
-  const idx = EXERCISE_ORDER.indexOf(name);
-  return idx >= 0 ? idx : 0;
-}
 
-// Xác định vùng bài (hip/knee/ankle) từ tên bài
 function getExerciseRegion(){
   const name = getCurrentExerciseName().toLowerCase();
-  if (name.includes("hip"))   return "hip";
-  if (name.includes("knee"))  return "knee";
+  if (name.includes("hip")) return "hip";
+  if (name.includes("knee")) return "knee";
   if (name.includes("ankle")) return "ankle";
-  return "hip"; // mặc định
+  return "hip";
 }
 
-// ========== VAS STATE & HÀM ==========
+/* =========================
+   EMG chỉ cho KNEE
+   - sensor_id = 5
+   - ẩn card khi không phải knee
+========================= */
+const emgCard = document.getElementById("emgCard");
+
+function isEmgEnabled(){
+  const ex = (getCurrentExerciseName() || "").toLowerCase();
+  return ex.includes("knee"); // 
+}
+
+/*  FIX LỖI: trước đây gọi syncEmgVisibility nhưng chưa định nghĩa */
+function syncEmgVisibility(){
+  if (!emgCard) return;
+  emgCard.classList.toggle("emg-hidden", !isEmgEnabled());
+}
+
+/* đổi bài tập -> reset + sync */
+exerciseSelect?.addEventListener("change", ()=>{
+  resetEmgBuffer();
+  syncEmgVisibility();
+  if (isEmgEnabled()){
+    ensureEmgChart();
+    emgUpdateChart();
+  }
+});
+
+/* ================= EMG WAVEFORM (Chart.js) ================= */
+const emgCanvas = document.getElementById("emgChart");
+let emgChartObj = null;
+let emgBuf = [];         // [{t:ms, v:number}]
+let emgRmsWindow = [];   // rms window
+
+function resetEmgBuffer(){
+  emgBuf = [];
+  emgRmsWindow = [];
+  const rmsEl = document.getElementById("emgRmsTxt");
+  if (rmsEl) rmsEl.textContent = "--";
+  if (emgChartObj){
+    emgChartObj.data.datasets[0].data = [];
+    emgChartObj.update("none");
+  }
+}
+
+function pickEmgValue(msg){
+  // Backend có thể gửi sender_id hoặc emg_id hoặc sensor_id
+  const sidRaw = (msg && (msg.sender_id ?? msg.emg_id ?? msg.sensor_id)) ;
+  const sid = sidRaw != null ? Number(sidRaw) : null;
+
+  // CHỈ nhận sensor 5
+  if (sid !== 5) return null;
+
+  // emg có thể là số hoặc object {v:...}
+  let v = null;
+  if (msg && msg.emg != null){
+    if (typeof msg.emg === "number") v = msg.emg;
+    else if (typeof msg.emg === "string") v = Number(msg.emg);
+    else if (typeof msg.emg === "object" && msg.emg.v != null) v = Number(msg.emg.v);
+  }
+
+  return (v != null && !Number.isNaN(v)) ? v : null;
+}
+
+
+function ensureEmgChart(){
+  if (!emgCanvas || emgChartObj) return;
+
+  const ctx = emgCanvas.getContext("2d");
+  emgChartObj = new Chart(ctx, {
+    type: "line",
+    data: { datasets: [{ label: "EMG (µV)", data: [], pointRadius: 0, borderWidth: 2, tension: 0 }] },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      normalized: true,
+      plugins: { legend: { display: false }, tooltip: { enabled: false } },
+      elements: { line: { capBezierPoints: false } },
+      scales: {
+        x: {
+          type: "linear",
+          ticks: { maxTicksLimit: 6, color: "#2b3a4a", font: { weight: "700" } },
+          grid: { color: "rgba(8,58,106,.10)", lineWidth: 1 },
+          border: { color: "rgba(8,58,106,.18)" }
+        },
+        y: {
+          ticks: { maxTicksLimit: 6, color: "#2b3a4a", font: { weight: "700" } },
+          grid: { color: "rgba(8,58,106,.10)", lineWidth: 1 },
+          border: { color: "rgba(8,58,106,.18)" }
+        }
+      }
+    }
+  });
+}
+
+function emgTrimToWindow(winSec){
+  const now = performance.now();
+  const cutoff = now - winSec * 1000;
+  while (emgBuf.length && emgBuf[0].t < cutoff) emgBuf.shift();
+}
+function emgAutoScale(){
+  // lấy max |v| trong window hiện tại
+  let m = 0;
+  for (const p of emgBuf){
+    const a = Math.abs(Number(p.v) || 0);
+    if (a > m) m = a;
+  }
+  // tránh scale = 0
+  if (m < 5) m = 5;
+
+  // nới biên 20% cho dễ nhìn
+  return Math.ceil(m * 1.2);
+}
+
+function emgUpdateChart(){
+  if (!emgChartObj) return;
+
+  const winSec = Number(document.getElementById("emgWin")?.value || 5);
+
+  // scale người dùng nhập = mức tối thiểu
+  let scaleMin = Number(document.getElementById("emgScale")?.value || 1000);
+
+  const winTxt = document.getElementById("emgWinTxt");
+  const scTxt  = document.getElementById("emgScaleTxt");
+  if (winTxt) winTxt.textContent = String(winSec);
+
+  // cắt buffer theo window
+  emgTrimToWindow(winSec);
+
+  // chuẩn hoá trục thời gian
+  const now  = performance.now();
+  const base = now - winSec * 1000;
+
+  const pts = emgBuf.map(p => ({
+    x: (p.t - base) / 1000.0,
+    y: Number(p.v) || 0
+  }));
+
+  emgChartObj.data.datasets[0].data = pts;
+
+  // ===== AUTO SCALE =====
+  // lấy max |y| trong window hiện tại
+  let maxAbs = 0;
+  for (const pt of pts){
+    const a = Math.abs(pt.y);
+    if (a > maxAbs) maxAbs = a;
+  }
+
+  // nới biên 20% cho dễ nhìn, chống =0
+  let autoScale = Math.ceil(Math.max(5, maxAbs * 1.2));
+
+  // scale cuối cùng: không nhỏ hơn scaleMin
+  const scale = Math.max(scaleMin, autoScale);
+
+  if (scTxt) scTxt.textContent = "±" + String(scale);
+
+  // set trục
+  emgChartObj.options.scales.y.min = -scale;
+  emgChartObj.options.scales.y.max = +scale;
+  emgChartObj.options.scales.x.min = 0;
+  emgChartObj.options.scales.x.max = winSec;
+
+  emgChartObj.update("none");
+}
+
+
+function emgPushValue(v){
+  const t = performance.now();
+  emgBuf.push({ t, v });
+
+  emgRmsWindow.push(v);
+  if (emgRmsWindow.length > 200) emgRmsWindow.shift();
+
+  let rms = 0;
+  if (emgRmsWindow.length){
+    let s2 = 0;
+    for (const x of emgRmsWindow) s2 += x*x;
+    rms = Math.sqrt(s2 / emgRmsWindow.length);
+  }
+  const rmsEl = document.getElementById("emgRmsTxt");
+  if (rmsEl) rmsEl.textContent = rms ? rms.toFixed(1) : "--";
+}
+
+/* update chart định kỳ (chỉ khi knee) */
+setInterval(() => {
+  if (!isEmgEnabled()) return;
+  ensureEmgChart();
+  emgUpdateChart();
+}, 80);
+
+["emgWin","emgScale"].forEach(id=>{
+  document.getElementById(id)?.addEventListener("change", ()=>{
+    if (!isEmgEnabled()) return;
+    ensureEmgChart();
+    emgUpdateChart();
+  });
+});
+
+/* ========== VAS STATE & HÀM ========== */
 const VAS_TEXT_VI = [
   "Không đau",
   "Đau rất nhẹ, thỉnh thoảng mới cảm thấy.",
@@ -3085,16 +3147,14 @@ function selectVASTick(val) {
   const label = document.getElementById("vasSelected");
   if (label) label.innerText = `${val} – ${desc}`;
 }
-function resetVASDefault() {
-  selectVASTick(0);
-}
 
-// Lưu VAS về backend (nếu có route /save_vas)
+function resetVASDefault() { selectVASTick(0); }
+
 function saveVAS(region, phase, val){
   const patCode = (document.getElementById("pat_code")?.value || "").trim();
   const payload = {
-    exercise_region: region, // 'hip' | 'knee' | 'ankle'
-    phase: phase,            // 'before' | 'after'
+    exercise_region: region,
+    phase: phase,
     vas: val,
     patient_code: patCode,
     exercise_name: getCurrentExerciseName()
@@ -3103,41 +3163,36 @@ function saveVAS(region, phase, val){
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
-  }).then(r => r.json())
-   .then(res => { console.log("[VAS] saved:", res); })
-   .catch(err => {
-      console.warn("[VAS] error saving (có thể chưa tạo route /save_vas):", err);
-   });
+  })
+  .then(r => r.json())
+  .then(res => console.log("[VAS] saved:", res))
+  .catch(err => console.warn("[VAS] error saving (có thể chưa tạo route /save_vas):", err));
 }
 
-// Mở modal VAS, set tiêu đề theo bài & phase, rồi gọi callback khi xác nhận
 function openVASModal(region, phase, onConfirm){
   const titleEl = document.getElementById("vasModalTitle");
-  const subEl   = document.getElementById("vasModalSubtitle");
+  const subEl = document.getElementById("vasModalSubtitle");
+
   let title = "Đánh giá mức độ đau (VAS)";
-  let sub   = "Vui lòng chọn mức độ đau từ 0 (không đau) đến 10 (đau tệ nhất).";
+  let sub = "Vui lòng chọn mức độ đau từ 0 (không đau) đến 10 (đau tệ nhất).";
 
   if (region === "hip") {
-    title = (phase === "before")
-      ? "Mức độ đau vùng hông TRƯỚC khi tập"
-      : "Mức độ đau vùng hông SAU khi tập";
+    title = (phase === "before") ? "Mức độ đau vùng hông TRƯỚC khi tập" : "Mức độ đau vùng hông SAU khi tập";
   } else if (region === "knee") {
-    title = (phase === "before")
-      ? "Mức độ đau vùng quanh gối (cơ đùi trước – sau) TRƯỚC khi tập"
-      : "Mức độ đau vùng quanh gối (cơ đùi trước – sau) SAU khi tập";
+    title = (phase === "before") ? "Mức độ đau vùng quanh gối (cơ đùi trước – sau) TRƯỚC khi tập" : "Mức độ đau vùng quanh gối (cơ đùi trước – sau) SAU khi tập";
   } else if (region === "ankle") {
-    title = (phase === "before")
-      ? "Mức độ đau vùng cổ chân TRƯỚC khi tập"
-      : "Mức độ đau vùng cổ chân SAU khi tập";
+    title = (phase === "before") ? "Mức độ đau vùng cổ chân TRƯỚC khi tập" : "Mức độ đau vùng cổ chân SAU khi tập";
   }
+
   if (titleEl) titleEl.innerText = title;
-  if (subEl)   subEl.innerText   = sub;
+  if (subEl) subEl.innerText = sub;
 
   resetVASDefault();
 
   const modalEl = document.getElementById("vasModal");
   if (!modalEl) return;
   const modal = new bootstrap.Modal(modalEl);
+
   const btnConfirm = document.getElementById("vasConfirmBtn");
   if (!btnConfirm) return;
 
@@ -3146,14 +3201,15 @@ function openVASModal(region, phase, onConfirm){
     modal.hide();
     if (typeof onConfirm === "function") onConfirm();
   };
+
   modal.show();
 }
 
-// ========== NÚT "LƯU KẾT QUẢ" = LƯU BỆNH NHÂN + BỆNH ÁN ==========
+/* ========== NÚT "LƯU KẾT QUẢ" ========== */
 if (btnSave) btnSave.addEventListener("click", async () => {
-  const name   = document.getElementById('pat_name').value.trim();
-  const cccd   = document.getElementById('pat_cccd').value.trim();
-  const dob    = document.getElementById('pat_dob').value.trim();
+  const name = document.getElementById('pat_name').value.trim();
+  const cccd = document.getElementById('pat_cccd').value.trim();
+  const dob = document.getElementById('pat_dob').value.trim();
   const gender = document.getElementById('pat_gender').value.trim();
   const weight = document.getElementById('pat_weight').value.trim();
   const height = document.getElementById('pat_height').value.trim();
@@ -3166,17 +3222,7 @@ if (btnSave) btnSave.addEventListener("click", async () => {
     return;
   }
 
-  // 1) Lưu / cập nhật thông tin bệnh nhân
-  const patientPayload = {
-    patient_code: patient_code,
-    name:   name,
-    national_id: cccd,
-    dob:    dob,
-    gender: gender,
-    weight: weight,
-    height: height
-  };
-
+  const patientPayload = { patient_code, name, national_id: cccd, dob, gender, weight, height };
   try {
     const res = await fetch("/api/patients", {
       method: "POST",
@@ -3184,40 +3230,24 @@ if (btnSave) btnSave.addEventListener("click", async () => {
       body: JSON.stringify(patientPayload)
     });
     const j = await res.json();
-    if (!j.ok) {
-      alert(j.msg || "Lưu thông tin bệnh nhân thất bại.");
-      return;
-    }
-    if (codeEl && j.patient_code) {
-      codeEl.value = j.patient_code;
-      patient_code = j.patient_code;
-    }
+    if (!j.ok) { alert(j.msg || "Lưu thông tin bệnh nhân thất bại."); return; }
+    if (codeEl && j.patient_code) { codeEl.value = j.patient_code; patient_code = j.patient_code; }
 
-    // 🔹 cập nhật currentPatient sau khi server trả về patient_code
     try{
-      localStorage.setItem("currentPatient", JSON.stringify({
-        code: patient_code, name, cccd, dob, gender, weight, height
-      }));
-    } catch(e){
-      console.warn("Không lưu currentPatient sau khi Save:", e);
-    }
-
+      localStorage.setItem("currentPatient", JSON.stringify({ code: patient_code, name, cccd, dob, gender, weight, height }));
+    }catch(e){ console.warn("Không lưu currentPatient sau khi Save:", e); }
   } catch (e) {
     console.error(e);
     alert("Có lỗi khi gửi dữ liệu bệnh nhân lên server.");
     return;
   }
 
-  // 2) Lưu bệnh án
   let exerciseScores = {};
-  try {
-    exerciseScores = JSON.parse(localStorage.getItem("exerciseScores") || "{}");
-  } catch (e) {
-    exerciseScores = {};
-  }
+  try { exerciseScores = JSON.parse(localStorage.getItem("exerciseScores") || "{}"); }
+  catch (e) { exerciseScores = {}; }
 
   const recordPayload = {
-    patient_code: patient_code,
+    patient_code,
     measure_date: measureDate,
     patient_info: { name, cccd, dob, gender, weight, height },
     exercise_scores: exerciseScores
@@ -3230,18 +3260,15 @@ if (btnSave) btnSave.addEventListener("click", async () => {
       body: JSON.stringify(recordPayload)
     });
     const j2 = await res2.json();
-    if (!j2.ok) {
-      alert(j2.msg || "Lưu bệnh án không thành công.");
-      return;
-    }
-    alert("✅ Đã lưu đầy đủ bệnh án điện tử (thông tin + điểm bài tập + VAS).");
+    if (!j2.ok) { alert(j2.msg || "Lưu bệnh án không thành công."); return; }
+    alert("✅ Đã lưu đầy đủ bệnh án (thông tin + điểm bài tập + VAS).");
   } catch (e) {
     console.error(e);
     alert("Có lỗi khi gửi bệnh án lên server.");
   }
 });
 
-// ========== SOCKET IO – cập nhật góc & thu mẫu ==========
+/* ========== SOCKET IO – cập nhật EMG + góc & thu mẫu ========== */
 window.socket = window.socket || io({
   transports: ['websocket'],
   upgrade: false,
@@ -3249,40 +3276,35 @@ window.socket = window.socket || io({
   reconnectionAttempts: 10,
   reconnectionDelay: 500
 });
-const socket = window.socket;
 
-socket.on('connect',       ()   => console.log('[SOCKET] connected:', socket.id));
-socket.on('connect_error', (e)  => console.error('[SOCKET] connect_error:', e));
-socket.on('disconnect',    (r)  => console.warn('[SOCKET] disconnected:', r));
+const socket = window.socket;
+socket.on('connect', () => console.log('[SOCKET] connected:', socket.id));
+socket.on('connect_error', (e) => console.error('[SOCKET] connect_error:', e));
+socket.on('disconnect', (r) => console.warn('[SOCKET] disconnected:', r));
 
 socket.on("imu_data", (msg) => {
-  // Bảng số trực tiếp
-  const tr = document.querySelector("#tblAngles tr");
-  if (tr) {
-    const tds = tr.querySelectorAll("td");
-    if (tds.length >= 3) {
-      if (msg.hip   != null) tds[0].textContent = Number(msg.hip).toFixed(2);
-      if (msg.knee  != null) tds[1].textContent = Number(msg.knee).toFixed(2);
-      if (msg.ankle != null) tds[2].textContent = Number(msg.ankle).toFixed(2);
-    }
+  // ===== EMG waveform: CHỈ VẼ KHI CHỌN KNEE FLEXION =====
+  if (isEmgEnabled()) {
+    const emgVal = pickEmgValue(msg); // pickEmgValue đọc msg.emg và lọc sensor 5
+    if (emgVal != null) emgPushValue(emgVal);
   }
 
-  // Badge nhỏ dưới 3D
+  // Badge góc dưới 3D
   if (msg.hip   != null) document.getElementById('liveHip').textContent   = Number(msg.hip).toFixed(1);
   if (msg.knee  != null) document.getElementById('liveKnee').textContent  = Number(msg.knee).toFixed(1);
   if (msg.ankle != null) document.getElementById('liveAnkle').textContent = Number(msg.ankle).toFixed(1);
 
-  // Nếu đang đo thì lưu mẫu để vẽ biểu đồ & tính ROM
+  // Thu mẫu ROM
   if (isMeasuring){
-    const hip   = Number(msg.hip   ?? 0);
-    const knee  = Number(msg.knee  ?? 0);
+    const hip = Number(msg.hip ?? 0);
+    const knee = Number(msg.knee ?? 0);
     const ankle = Number(msg.ankle ?? 0);
     currentSamples.push({hip,knee,ankle});
   }
 
   // 3D
-  const hip   = msg.hip   ?? 0;
-  const knee  = msg.knee  ?? 0;
+  const hip = msg.hip ?? 0;
+  const knee = msg.knee ?? 0;
   const ankle = msg.ankle ?? 0;
   if (typeof window.pushAngles === "function") {
     window.pushAngles(hip, knee, ankle);
@@ -3291,24 +3313,21 @@ socket.on("imu_data", (msg) => {
   }
 });
 
-// ========== CORE: THỰC SỰ START/STOP ĐO (không gắn trực tiếp vào nút) ==========
+/* ========== CORE: THỰC SỰ START/STOP ĐO ========== */
 async function reallyStartMeasurement(){
   if (isMeasuring) return;
-  try {
-    const curName   = getCurrentExerciseName();
+
+  try{
+    const curName = getCurrentExerciseName();
     const firstName = EXERCISE_ORDER[0];
-    if (curName === firstName) {
-      localStorage.removeItem("exerciseScores");
-    }
-  } catch(e){}
+    if (curName === firstName) localStorage.removeItem("exerciseScores");
+  }catch(e){}
 
   const r = await fetch("/session/start", { method: "POST" });
   const j = await r.json();
   console.log("[START RESPONSE]", j);
-  if (!j.ok) {
-    alert(j.msg || "Không start được phiên đo");
-    return;
-  }
+
+  if (!j.ok) { alert(j.msg || "Không start được phiên đo"); return; }
 
   isMeasuring = true;
   currentSamples = [];
@@ -3316,97 +3335,101 @@ async function reallyStartMeasurement(){
 
   btnStart.disabled = true;
   btnStart.textContent = "Đang đo...";
-  btnStop.disabled  = false;
+  btnStop.disabled = false;
   btnStop.textContent = "Kết thúc đo";
 
-  resultPanel.style.display  = "none";
+  resultPanel.style.display = "none";
   summaryPanel.style.display = "none";
+
+  /* ✅ start đo -> reset EMG buffer cho sạch */
+  resetEmgBuffer();
+  syncEmgVisibility();
+  if (isEmgEnabled()){
+    ensureEmgChart();
+    emgUpdateChart();
+  }
 }
 
 async function reallyStopMeasurement(){
   if (!isMeasuring) return null;
 
   const r = await fetch("/session/stop", { method: "POST" });
-  let j = {};
-  try { j = await r.json(); } catch(e){}
+  try { await r.json(); } catch(e){}
 
   isMeasuring = false;
   stopHeartSim();
+
   btnStart.disabled = false;
-  btnStop.disabled  = true;
+  btnStop.disabled = true;
   btnStart.textContent = "Bắt đầu đo";
 
-  // Tính ROM & Score từ currentSamples
   let romHip = 0, romKnee = 0, romAnkle = 0, score = 0;
   let maxKnee = 0, minKnee = 0;
 
   if (currentSamples.length){
-    const hips    = currentSamples.map(s => s.hip);
-    const knees   = currentSamples.map(s => s.knee);
-    const ankles  = currentSamples.map(s => s.ankle);
-    const maxHip   = Math.max(...hips);
-    const minHip   = Math.min(...hips);
-    maxKnee        = Math.max(...knees);
-    minKnee        = Math.min(...knees);
+    const hips = currentSamples.map(s => s.hip);
+    const knees = currentSamples.map(s => s.knee);
+    const ankles = currentSamples.map(s => s.ankle);
+
+    const maxHip = Math.max(...hips);
+    const minHip = Math.min(...hips);
+    maxKnee = Math.max(...knees);
+    minKnee = Math.min(...knees);
     const maxAnkle = Math.max(...ankles);
     const minAnkle = Math.min(...ankles);
 
-    romHip   = maxHip   - minHip;
-    romKnee  = maxKnee  - minKnee;
+    romHip = maxHip - minHip;
+    romKnee = maxKnee - minKnee;
     romAnkle = maxAnkle - minAnkle;
-    score    = fmaScore(romKnee);
+
+    score = fmaScore(romKnee);
   }
 
   const exName = getCurrentExerciseName();
   const result = { name: exName, romHip, romKnee, romAnkle, score, maxKnee, minKnee };
 
-  // Lưu vào localStorage (để tab Biểu đồ đọc lại)
   let store = {};
-  try {
-    store = JSON.parse(localStorage.getItem("exerciseScores") || "{}");
-  } catch(e){
-    store = {};
-  }
+  try { store = JSON.parse(localStorage.getItem("exerciseScores") || "{}"); }
+  catch(e){ store = {}; }
+
   store[exName] = result;
   localStorage.setItem("exerciseScores", JSON.stringify(store));
 
-  // Lấy patient code
   const pat = (document.getElementById("pat_code")?.value || "").trim();
-
-  // URL biểu đồ
   let url = "/charts?exercise=" + encodeURIComponent(exName);
   if (pat) url += "&patient_code=" + encodeURIComponent(pat);
   return url;
 }
 
-// ========== NÚT BẮT ĐẦU / KẾT THÚC ĐO: THÊM VAS TRƯỚC & SAU ==========
+/* ========== NÚT BẮT ĐẦU / KẾT THÚC ĐO: THÊM VAS TRƯỚC & SAU ========== */
 if (btnStart) btnStart.addEventListener("click", () => {
   const region = getExerciseRegion();
-  openVASModal(region, "before", () => {
-    // Sau khi chọn xong VAS TRƯỚC -> bắt đầu đo
-    reallyStartMeasurement();
-  });
+  openVASModal(region, "before", () => { reallyStartMeasurement(); });
 });
 
 if (btnStop) btnStop.addEventListener("click", async () => {
   const url = await reallyStopMeasurement();
   if (!url) return;
   const region = getExerciseRegion();
-  // Sau khi dừng đo & tính ROM -> hỏi VAS SAU, rồi mới chuyển trang
-  openVASModal(region, "after", () => {
-    window.location.href = url;
-  });
+  openVASModal(region, "after", () => { window.location.href = url; });
 });
 
-// Khởi tạo VAS + load lại bệnh nhân khi vừa vào trang
+// Khởi tạo VAS + load bệnh nhân + sync EMG
 document.addEventListener("DOMContentLoaded", () => {
   resetVASDefault();
   loadCurrentPatientFromLocalStorage();
+  syncEmgVisibility();
+  if (isEmgEnabled()){
+    ensureEmgChart();
+    emgUpdateChart();
+  }
 });
 </script>
 
-</body></html>
-"""
+</body></html>"""
+
+
+
 
 SETTINGS_HTML = """
 <!doctype html><html lang="vi"><head>
@@ -3615,7 +3638,7 @@ document.addEventListener("DOMContentLoaded", loadSettings);
 </body></html>
 """
 
-CHARTS_HTML = """
+CHARTS_HTML = r"""
 <!doctype html>
 <html lang="vi">
 <head>
@@ -3629,158 +3652,76 @@ CHARTS_HTML = """
 <style>
 :root { --blue:#1669c9; --sbw:260px; }
 
-body{
-  background:#e8f3ff;
-  margin:0;
-  font-size:15px;
-}
-
+body{ background:#e8f3ff; margin:0; font-size:15px; }
 .layout{ display:flex; gap:16px; position:relative; }
 
-.sidebar-col{
-  flex:0 0 var(--sbw);
-  max-width:var(--sbw);
-  transition:all .28s ease;
-}
+.sidebar-col{ flex:0 0 var(--sbw); max-width:var(--sbw); transition:all .28s ease; }
 .sidebar{
   background:var(--blue); color:#fff;
-  border-top-right-radius:16px;
-  border-bottom-right-radius:16px;
-  padding:16px;
-  min-height:100vh;
+  border-top-right-radius:16px; border-bottom-right-radius:16px;
+  padding:16px; min-height:100vh;
 }
 .main-col{ flex:1 1 auto; min-width:0; }
 
-body.sb-collapsed .sidebar-col{
-  flex-basis:0 !important;
-  max-width:0 !important;
-}
-body.sb-collapsed .sidebar{
-  padding:0 !important;
-}
-body.sb-collapsed .sidebar *{
-  display:none;
-}
+body.sb-collapsed .sidebar-col{ flex-basis:0 !important; max-width:0 !important; }
+body.sb-collapsed .sidebar{ padding:0 !important; }
+body.sb-collapsed .sidebar *{ display:none; }
 
 #btnToggleSB{
-  border:2px solid #d8e6ff;
-  background:#fff;
-  border-radius:10px;
-  padding:6px 10px;
-  font-weight:700;
+  border:2px solid #d8e6ff; background:#fff;
+  border-radius:10px; padding:6px 10px; font-weight:700;
 }
 #btnToggleSB:hover{ background:#eef6ff; }
 
 .menu-btn{
-  width:100%;
-  display:block;
-  background:#1d74d8;
-  border:none;
-  color:#fff;
-  padding:10px 12px;
-  margin:8px 0;
-  border-radius:12px;
-  font-weight:600;
-  text-align:left;
-  text-decoration:none;
+  width:100%; display:block; background:#1d74d8; border:none; color:#fff;
+  padding:10px 12px; margin:8px 0; border-radius:12px;
+  font-weight:600; text-align:left; text-decoration:none;
 }
 .menu-btn:hover{ background:#1f80ea; }
 .menu-btn.active{ background:#0f5bb0; }
 
 .panel{
-  background:#fff;
-  border-radius:16px;
+  background:#fff; border-radius:16px;
   box-shadow:0 8px 20px rgba(16,24,40,0.10);
-  padding:16px;
-  margin-bottom:16px;
+  padding:16px; margin-bottom:16px;
 }
-
 .chart-box{ height:260px; }
 
 /* Khối đánh giá */
 .eval-panel{
-  background:#ffffff;
-  border-radius:18px;
+  background:#ffffff; border-radius:18px;
   box-shadow:0 10px 24px rgba(15,23,42,.16);
   padding:18px 18px 14px 18px;
 }
-.eval-header{
-  font-weight:800;
-  color:#0b3769;
-  font-size:1.1rem;
-}
-.eval-subtitle{
-  font-size:.9rem;
-  color:#64748b;
-}
-.eval-item{
-  font-size:.95rem;
-}
+.eval-header{ font-weight:800; color:#0b3769; font-size:1.1rem; }
+.eval-subtitle{ font-size:.9rem; color:#64748b; }
+.eval-item{ font-size:.95rem; }
 .eval-item + .eval-item{
-  border-top:1px dashed #e2e8f0;
-  margin-top:10px;
-  padding-top:10px;
+  border-top:1px dashed #e2e8f0; margin-top:10px; padding-top:10px;
 }
+.eval-badge{ font-size:.8rem; padding:4px 8px; border-radius:999px; }
+#totalScore{ font-size:.95rem; padding:6px 10px; border-radius:999px; }
 
-.eval-badge{
-  font-size:.8rem;
-  padding:4px 8px;
-  border-radius:999px;
-}
-
-#totalScore{
-  font-size:.95rem;
-  padding:6px 10px;
-  border-radius:999px;
-}
-
-/* nhấn mạnh nhãn đánh giá (Yếu / Trung bình / Tốt) */
-.strength-label{
-  font-weight:700;
-  font-size:1rem;
-  color:#0b3769;
-}
+.strength-label{ font-weight:700; font-size:1rem; color:#0b3769; }
 .strength-desc{
-  font-size:.9rem;
-  color:#6b7280;
+  font-size:.9rem; color:#0b3769; font-weight:500;
+  background:#e8f5ff; border-radius:10px;
 }
 
-/* NOTE BOX cho mô tả đánh giá */
-.strength-desc{
-  font-size:.9rem;
-  color:#0b3769;   /* MÀU XANH ĐẬM CHO RÕ */
-  font-weight:500;
-  background:#e8f5ff;
-  border-radius:10px;
-}
-
-/* Tổng điểm các bài đã đo – to, ở giữa */
+/* Tổng điểm */
 .total-summary{
-  margin-top:10px;
-  text-align:center;
-  font-weight:800;
-  font-size:1.05rem;
-  color:#0b3769;
+  margin-top:10px; text-align:center; font-weight:800;
+  font-size:1.05rem; color:#0b3769;
 }
 .total-summary span{
-  display:inline-block;
-  margin-left:6px;
-  padding:4px 14px;
-  border-radius:999px;
-  background:#1d4ed8;
-  color:#fff;
-  font-size:1rem;
+  display:inline-block; margin-left:6px; padding:4px 14px;
+  border-radius:999px; background:#1d4ed8; color:#fff; font-size:1rem;
 }
 
-/* Mini VAS box */
-.vas-mini-value{
-  font-weight:700;
-  font-size:1rem;
-}
-.vas-mini-label{
-  font-size:.85rem;
-  color:#64748b;
-}
+/* Mini VAS */
+.vas-mini-value{ font-weight:700; font-size:1rem; }
+.vas-mini-label{ font-size:.85rem; color:#64748b; }
 </style>
 </head>
 
@@ -3790,7 +3731,6 @@ body.sb-collapsed .sidebar *{
   <div class="container-fluid d-flex align-items-center">
     <button id="btnToggleSB" class="btn me-2">☰</button>
     <span class="navbar-brand mb-0">Xin chào, {{username}}</span>
-
     <div class="ms-auto d-flex align-items-center gap-3">
       <img src="/static/unnamed.png" height="48">
     </div>
@@ -3826,7 +3766,7 @@ body.sb-collapsed .sidebar *{
                 {% if exercise_name %}
                 <div class="text-muted small">
                   <span data-i18n="charts.exercise">Bài tập:</span>
-                  <strong> {{ exercise_name }}</strong>
+                  <strong>{{ exercise_name }}</strong>
                 </div>
                 {% endif %}
 
@@ -3842,9 +3782,7 @@ body.sb-collapsed .sidebar *{
                 <a class="btn btn-outline-success btn-sm"
                    href="/session/export_csv{% if patient_code %}?patient_code={{ patient_code }}{% endif %}"
                    target="_blank"
-                   data-i18n="charts.save_csv">
-                  Lưu CSV
-                </a>
+                   data-i18n="charts.save_csv">Lưu CSV</a>
 
                 <a class="btn btn-outline-primary btn-sm" href="/charts_emg" data-i18n="charts.emg">EMG</a>
 
@@ -3859,6 +3797,15 @@ body.sb-collapsed .sidebar *{
           <div class="panel"><h6 data-i18n="charts.hip">Hip (độ)</h6><div class="chart-box"><canvas id="hipChart"></canvas></div></div>
           <div class="panel"><h6 data-i18n="charts.knee">Knee (độ)</h6><div class="chart-box"><canvas id="kneeChart"></canvas></div></div>
           <div class="panel"><h6 data-i18n="charts.ankle">Ankle (độ)</h6><div class="chart-box"><canvas id="ankleChart"></canvas></div></div>
+
+          <!-- ✅ EMG CHART (raw/rms/env) ngay trong /charts -->
+          <div class="panel">
+            <h6 class="mb-2">EMG (raw / RMS / envelope) – 6s cuối</h6>
+            <div class="chart-box"><canvas id="emgChart"></canvas></div>
+            <div class="small text-muted mt-2">
+              Nếu đường EMG không hiện: kiểm tra route /charts đã truyền emg/emg_rms/emg_env và dữ liệu có cùng chiều với t_ms.
+            </div>
+          </div>
         </div>
 
         <div class="col-lg-3">
@@ -3903,10 +3850,18 @@ body.sb-collapsed .sidebar *{
                 <div class="small mt-1">
                   {% if diff > 0 %}
                     <span class="badge bg-danger me-1" data-i18n="charts.vas_more">Đau tăng</span>
-                    <span class="text-muted" data-i18n="charts.vas_more_desc">Tăng khoảng {{ '%.1f'|format(diff) }} điểm sau bài tập.</span>
+                    <span class="text-muted">
+                      <span data-i18n="charts.vas_more_desc_prefix">Tăng khoảng</span>
+                      <strong>{{ '%.1f'|format(diff) }}</strong>
+                      <span data-i18n="charts.vas_more_desc_suffix">điểm sau bài tập.</span>
+                    </span>
                   {% elif diff < 0 %}
                     <span class="badge bg-success me-1" data-i18n="charts.vas_less">Đau giảm</span>
-                    <span class="text-muted" data-i18n="charts.vas_less_desc">Giảm khoảng {{ '%.1f'|format(-diff) }} điểm sau bài tập.</span>
+                    <span class="text-muted">
+                      <span data-i18n="charts.vas_less_desc_prefix">Giảm khoảng</span>
+                      <strong>{{ '%.1f'|format(-diff) }}</strong>
+                      <span data-i18n="charts.vas_less_desc_suffix">điểm sau bài tập.</span>
+                    </span>
                   {% else %}
                     <span class="badge bg-secondary me-1" data-i18n="charts.vas_same">Không đổi</span>
                     <span class="text-muted" data-i18n="charts.vas_same_desc">Mức đau không thay đổi sau bài tập.</span>
@@ -3945,10 +3900,9 @@ body.sb-collapsed .sidebar *{
             <hr class="my-2">
             <div class="small fw-bold mb-1" data-i18n="charts.all_ex_summary">Tổng kết các bài đã đo</div>
             <div id="allExercisesSummary" class="small"></div>
-
           </div>
 
-          <!-- Bảng EMG -->
+          <!-- Bảng EMG (demo) -->
           <div class="panel">
             <div class="eval-header mb-1" data-i18n="charts.emg_title">Tín hiệu điện cơ EMG</div>
             <table class="table table-sm mb-0">
@@ -3957,12 +3911,9 @@ body.sb-collapsed .sidebar *{
                   <th scope="row" data-i18n="charts.emg_thigh">Cơ đùi</th>
                   <td class="text-end">
                     <span style="
-                        background:#dcfce7;
-                        color:#166534;
-                        padding:4px 10px;
-                        border-radius:8px;
-                        font-weight:600;
-                        font-size:0.85rem;
+                        background:#dcfce7; color:#166534;
+                        padding:4px 10px; border-radius:8px;
+                        font-weight:600; font-size:0.85rem;
                     " data-i18n="charts.emg_good">Khỏe</span>
                   </td>
                 </tr>
@@ -3983,110 +3934,46 @@ body.sb-collapsed .sidebar *{
 </div>
 
 <script>
-// ======= I18N chung cho trang biểu đồ =======
+// ======= I18N (giữ nguyên như bạn) =======
 const I18N = {
   vi: {
-    "menu.title":"MENU",
-    "menu.home":"Trang chủ",
-    "menu.calib":"Hiệu chuẩn",
-    "menu.patinfo":"Thông tin bệnh nhân",
-    "menu.record":"Bệnh án",
-    "menu.charts":"Biểu đồ",
-    "menu.settings":"Cài đặt",
-
-    "charts.title":"Biểu đồ góc khớp theo thời gian",
-    "charts.subtitle":"Phiên đo gần nhất.",
-    "charts.exercise":"Bài tập:",
-    "charts.patient_code":"Mã bệnh nhân:",
-    "charts.save_csv":"Lưu CSV",
-    "charts.emg":"EMG",
-    "charts.next_ex":"Bài tập tiếp theo",
-    "charts.hip":"Hip (độ)",
-    "charts.knee":"Knee (độ)",
-    "charts.ankle":"Ankle (độ)",
-
-    "charts.vas_title":"Đau chủ quan (VAS)",
-    "charts.vas_sub":"Mức đau trước và sau bài tập hiện tại (0–10).",
-    "charts.vas_before":"Trước khi tập",
-    "charts.vas_after":"Sau khi tập",
-    "charts.vas_none":"Chưa ghi nhận",
-    "charts.vas_more":"Đau tăng",
-    "charts.vas_more_desc":"Tăng khoảng ... điểm sau bài tập.",
-    "charts.vas_less":"Đau giảm",
-    "charts.vas_less_desc":"Giảm khoảng ... điểm sau bài tập.",
-    "charts.vas_same":"Không đổi",
-    "charts.vas_same_desc":"Mức đau không thay đổi sau bài tập.",
-    "charts.vas_not_enough":"Chưa đủ dữ liệu VAS trước/sau cho bài này.",
-    "charts.vas_no_data":"Chưa ghi nhận VAS cho bài tập hiện tại.",
-
-    "charts.fma_title":"Đánh giá FMA",
-    "charts.loading":"Đang xử lý...",
-    "charts.current_score":"Điểm bài hiện tại:",
-    "charts.all_ex_summary":"Tổng kết các bài đã đo",
-
-    "charts.emg_title":"Tín hiệu điện cơ EMG",
-    "charts.emg_thigh":"Cơ đùi",
-    "charts.emg_good":"Khỏe",
-    "charts.emg_shank":"Cơ cẳng chân"
+    "menu.title":"MENU","menu.home":"Trang chủ","menu.calib":"Hiệu chuẩn","menu.patinfo":"Thông tin bệnh nhân",
+    "menu.record":"Bệnh án","menu.charts":"Biểu đồ","menu.settings":"Cài đặt",
+    "charts.title":"Biểu đồ góc khớp theo thời gian","charts.subtitle":"Phiên đo gần nhất.",
+    "charts.exercise":"Bài tập:","charts.patient_code":"Mã bệnh nhân:","charts.save_csv":"Lưu CSV",
+    "charts.emg":"EMG","charts.next_ex":"Bài tập tiếp theo","charts.hip":"Hip (độ)","charts.knee":"Knee (độ)","charts.ankle":"Ankle (độ)",
+    "charts.vas_title":"Đau chủ quan (VAS)","charts.vas_sub":"Mức đau trước và sau bài tập hiện tại (0–10).",
+    "charts.vas_before":"Trước khi tập","charts.vas_after":"Sau khi tập","charts.vas_none":"Chưa ghi nhận",
+    "charts.vas_more":"Đau tăng","charts.vas_more_desc_prefix":"Tăng khoảng","charts.vas_more_desc_suffix":"điểm sau bài tập.",
+    "charts.vas_less":"Đau giảm","charts.vas_less_desc_prefix":"Giảm khoảng","charts.vas_less_desc_suffix":"điểm sau bài tập.",
+    "charts.vas_same":"Không đổi","charts.vas_same_desc":"Mức đau không thay đổi sau bài tập.",
+    "charts.vas_not_enough":"Chưa đủ dữ liệu VAS trước/sau cho bài này.","charts.vas_no_data":"Chưa ghi nhận VAS cho bài tập hiện tại.",
+    "charts.fma_title":"Đánh giá FMA","charts.loading":"Đang xử lý...","charts.current_score":"Điểm bài hiện tại:","charts.all_ex_summary":"Tổng kết các bài đã đo",
+    "charts.emg_title":"Tín hiệu điện cơ EMG","charts.emg_thigh":"Cơ đùi","charts.emg_good":"Khỏe","charts.emg_shank":"Cơ cẳng chân"
   },
   en: {
-    "menu.title":"MENU",
-    "menu.home":"Home",
-    "menu.calib":"Calibration",
-    "menu.patinfo":"Patient info",
-    "menu.record":"Records",
-    "menu.charts":"Charts",
-    "menu.settings":"Settings",
-
-    "charts.title":"Joint angle chart over time",
-    "charts.subtitle":"Most recent session.",
-    "charts.exercise":"Exercise:",
-    "charts.patient_code":"Patient code:",
-    "charts.save_csv":"Save CSV",
-    "charts.emg":"EMG",
-    "charts.next_ex":"Next exercise",
-    "charts.hip":"Hip (deg)",
-    "charts.knee":"Knee (deg)",
-    "charts.ankle":"Ankle (deg)",
-
-    "charts.vas_title":"Subjective pain (VAS)",
-    "charts.vas_sub":"Pain level before and after current exercise (0–10).",
-    "charts.vas_before":"Before exercise",
-    "charts.vas_after":"After exercise",
-    "charts.vas_none":"No data",
-    "charts.vas_more":"Pain increased",
-    "charts.vas_more_desc":"Increased pain after exercise.",
-    "charts.vas_less":"Pain decreased",
-    "charts.vas_less_desc":"Decreased pain after exercise.",
-    "charts.vas_same":"No change",
-    "charts.vas_same_desc":"Pain level unchanged.",
-    "charts.vas_not_enough":"Not enough VAS data for this exercise.",
-    "charts.vas_no_data":"No VAS data recorded.",
-
-    "charts.fma_title":"FMA evaluation",
-    "charts.loading":"Processing...",
-    "charts.current_score":"Score of this exercise:",
-    "charts.all_ex_summary":"Summary of all exercises",
-
-    "charts.emg_title":"EMG signal",
-    "charts.emg_thigh":"Thigh muscle",
-    "charts.emg_good":"Strong",
-    "charts.emg_shank":"Shank muscle"
+    "menu.title":"MENU","menu.home":"Home","menu.calib":"Calibration","menu.patinfo":"Patient info",
+    "menu.record":"Records","menu.charts":"Charts","menu.settings":"Settings",
+    "charts.title":"Joint angle chart over time","charts.subtitle":"Most recent session.",
+    "charts.exercise":"Exercise:","charts.patient_code":"Patient code:","charts.save_csv":"Save CSV",
+    "charts.emg":"EMG","charts.next_ex":"Next exercise","charts.hip":"Hip (deg)","charts.knee":"Knee (deg)","charts.ankle":"Ankle (deg)",
+    "charts.vas_title":"Subjective pain (VAS)","charts.vas_sub":"Pain level before and after current exercise (0–10).",
+    "charts.vas_before":"Before exercise","charts.vas_after":"After exercise","charts.vas_none":"No data",
+    "charts.vas_more":"Higher pain","charts.vas_more_desc_prefix":"Increased by","charts.vas_more_desc_suffix":"points after the exercise.",
+    "charts.vas_less":"Lower pain","charts.vas_less_desc_prefix":"Decreased by","charts.vas_less_desc_suffix":"points after the exercise.",
+    "charts.vas_same":"No change","charts.vas_same_desc":"Pain level unchanged.",
+    "charts.vas_not_enough":"Not enough VAS data for this exercise.","charts.vas_no_data":"No VAS data recorded.",
+    "charts.fma_title":"FMA evaluation","charts.loading":"Processing...","charts.current_score":"Score of this exercise:","charts.all_ex_summary":"Summary of all exercises",
+    "charts.emg_title":"EMG signal","charts.emg_thigh":"Thigh muscle","charts.emg_good":"Strong","charts.emg_shank":"Shank muscle"
   }
 };
-
 function applyLanguage(lang){
   const dict = I18N[lang] || I18N.vi;
   document.querySelectorAll("[data-i18n]").forEach(el=>{
     const key = el.getAttribute("data-i18n");
     if (dict[key]) el.textContent = dict[key];
   });
-  document.querySelectorAll("[data-i18n-placeholder]").forEach(el=>{
-    const key = el.getAttribute("data-i18n-placeholder");
-    if (dict[key]) el.placeholder = dict[key];
-  });
 }
-
 document.addEventListener("DOMContentLoaded", ()=>{
   const lang = localStorage.getItem("appLang") || "vi";
   applyLanguage(lang);
@@ -4094,85 +3981,90 @@ document.addEventListener("DOMContentLoaded", ()=>{
 </script>
 
 <script>
+// ===== DATA FROM SERVER (Jinja) =====
+const t_ms_raw    = {{ (t_ms    or []) | tojson }};
+const hip_raw     = {{ (hip     or []) | tojson }};
+const knee_raw    = {{ (knee    or []) | tojson }};
+const ankle_raw   = {{ (ankle   or []) | tojson }};
+
+const emg_raw     = {{ (emg     or []) | tojson }};
+const emg_rms_raw = {{ (emg_rms or []) | tojson }};
+const emg_env_raw = {{ (emg_env or []) | tojson }};
+
+const currentExerciseName = {{ (exercise_name or '') | tojson }};
+const patientCode         = {{ (patient_code  or '') | tojson }};
+</script>
+
+<script>
 document.getElementById("btnToggleSB").onclick = () =>
   document.body.classList.toggle("sb-collapsed");
 
-// Ngôn ngữ hiện tại
 const CURRENT_LANG = localStorage.getItem("appLang") || "vi";
 
-// Các câu text động dùng trong JS
 const TEXT = {
-  vi: {
-    no_ex_name   : "Chưa có tên bài tập.",
-    no_rom       : "Không có dữ liệu ROM cho bài hiện tại.",
-    no_ex_saved  : "Chưa có bài nào được lưu.",
-    total_all    : "Tổng điểm các bài đã đo:",
-    finished_all : "Đã hoàn thành các bài tập. Hệ thống sẽ quay lại trang đo."
-  },
-  en: {
-    no_ex_name   : "No exercise name.",
-    no_rom       : "No ROM data for the current exercise.",
-    no_ex_saved  : "No exercise has been saved yet.",
-    total_all    : "Total score of all exercises:",
-    finished_all : "All exercises are completed. System will go back to measurement page."
-  }
+  vi: { no_ex_name:"Chưa có tên bài tập.", no_rom:"Không có dữ liệu ROM cho bài hiện tại.",
+        no_ex_saved:"Chưa có bài nào được lưu.", total_all:"Tổng điểm các bài đã đo:",
+        finished_all:"Đã hoàn thành các bài tập. Hệ thống sẽ quay lại trang đo." },
+  en: { no_ex_name:"No exercise name.", no_rom:"No ROM data for the current exercise.",
+        no_ex_saved:"No exercise has been saved yet.", total_all:"Total score of all exercises:",
+        finished_all:"All exercises are completed. System will go back to measurement page." }
 };
 
 const STRENGTH_TEXT = {
-  vi: {
-    good_label : "Tốt",
-    good_desc  : "Biên độ vận động lớn, kiểm soát động tác tốt.",
-    mid_label  : "Trung bình",
-    mid_desc   : "Biên độ vận động ở mức chấp nhận được, nên tiếp tục tập để cải thiện.",
-    weak_label : "Yếu",
-    weak_desc  : "Biên độ vận động còn hạn chế, cần tăng cường tập luyện và theo dõi."
-  },
-  en: {
-    good_label : "Good",
-    good_desc  : "Large range of motion with good control.",
-    mid_label  : "Moderate",
-    mid_desc   : "Acceptable range of motion, further training is recommended.",
-    weak_label : "Weak",
-    weak_desc  : "Limited range of motion, needs more training and follow-up."
-  }
+  vi:{ good_label:"Tốt", good_desc:"Biên độ vận động lớn, kiểm soát động tác tốt.",
+       mid_label:"Trung bình", mid_desc:"Biên độ vận động ở mức chấp nhận được, nên tiếp tục tập để cải thiện.",
+       weak_label:"Yếu", weak_desc:"Biên độ vận động còn hạn chế, cần tăng cường tập luyện và theo dõi." },
+  en:{ good_label:"Good", good_desc:"Large range of motion with good control.",
+       mid_label:"Moderate", mid_desc:"Acceptable range of motion, further training is recommended.",
+       weak_label:"Weak", weak_desc:"Limited range of motion, needs more training and follow-up." }
 };
 
-// Dữ liệu từ server (thô)
-const t_ms_raw    = {{ t_ms|tojson }};
-const hip_raw     = {{ hip|tojson }};
-const knee_raw    = {{ knee|tojson }};
-const ankle_raw   = {{ ankle|tojson }};
-const currentExerciseName = {{ (exercise_name or '')|tojson }};
-const patientCode         = {{ (patient_code or '')|tojson }};
+// ====== COPY RA BIẾN CHẠY (không dùng trực tiếp raw) ======
+let t_ms     = (t_ms_raw    || []).slice();
+let hipArr   = (hip_raw     || []).slice();
+let kneeArr  = (knee_raw    || []).slice();
+let ankleArr = (ankle_raw   || []).slice();
 
-// ===== CHỈ LẤY 5 GIÂY CUỐI =====
+let emgArr    = (emg_raw     || []).slice();
+let emgRmsArr = (emg_rms_raw || []).slice();
+let emgEnvArr = (emg_env_raw || []).slice();
+
+// ===== CLIP 6 GIÂY CUỐI (đồng bộ theo t_ms) =====
 const WINDOW_MS = 6000;
+(function clipLastWindow(){
+  if (!t_ms.length) return;
 
-let t_ms    = t_ms_raw;
-let hipArr  = hip_raw;
-let kneeArr = knee_raw;
-let ankleArr= ankle_raw;
-
-if (t_ms_raw && t_ms_raw.length) {
-  const lastT = t_ms_raw[t_ms_raw.length - 1];
+  const lastT = t_ms[t_ms.length - 1];
   const minT  = lastT - WINDOW_MS;
 
   let startIdx = 0;
-  while (startIdx < t_ms_raw.length && t_ms_raw[startIdx] < minT) {
-    startIdx++;
+  while (startIdx < t_ms.length && t_ms[startIdx] < minT) startIdx++;
+
+  if (startIdx > 0 && startIdx < t_ms.length) {
+    t_ms     = t_ms.slice(startIdx);
+    hipArr   = hipArr.slice(startIdx);
+    kneeArr  = kneeArr.slice(startIdx);
+    ankleArr = ankleArr.slice(startIdx);
+
+    // emg arrays: nếu length khác t_ms, vẫn slice an toàn theo min length
+    if (emgArr.length === t_ms_raw.length)    emgArr    = emgArr.slice(startIdx);
+    if (emgRmsArr.length === t_ms_raw.length) emgRmsArr = emgRmsArr.slice(startIdx);
+    if (emgEnvArr.length === t_ms_raw.length) emgEnvArr = emgEnvArr.slice(startIdx);
   }
+})();
 
-  if (startIdx > 0 && startIdx < t_ms_raw.length) {
-    t_ms     = t_ms_raw.slice(startIdx);
-    hipArr   = hip_raw.slice(startIdx);
-    kneeArr  = knee_raw.slice(startIdx);
-    ankleArr = ankle_raw.slice(startIdx);
-  }
-}
+// ====== EXPORT DEBUG (gõ _dbg() trong console) ======
+window._dbg = () => ({
+  url: location.pathname,
+  t_len: t_ms.length,
+  hip_len: hipArr.length,
+  emg_len: emgArr.length,
+  emg_rms_len: emgRmsArr.length,
+  emg_env_len: emgEnvArr.length,
+  last_t: t_ms.length ? t_ms[t_ms.length-1] : null
+});
 
-const evalBox = document.getElementById("evalContent");
-const totalScoreSpan = document.getElementById("totalScore");
-
+// ====== CHART OPTIONS ======
 const commonOptions = {
   responsive:true, maintainAspectRatio:false,
   interaction:{ mode:"index", intersect:false },
@@ -4183,60 +4075,83 @@ const commonOptions = {
   }
 };
 
-function makeChart(id, arr){
-  new Chart(document.getElementById(id), {
+function makeChart(canvasId, labels, yArr){
+  const el = document.getElementById(canvasId);
+  if (!el) return;
+  new Chart(el, {
     type:"line",
-    data:{ labels:t_ms, datasets:[{data:arr, borderWidth:2, tension:0.15 }]},
-    options:commonOptions
+    data:{ labels, datasets:[{ data:yArr, borderWidth:2, tension:0.15 }]},
+    options: commonOptions
   });
 }
 
-makeChart("hipChart", hipArr);
-makeChart("kneeChart", kneeArr);
-makeChart("ankleChart", ankleArr);
+makeChart("hipChart",   t_ms, hipArr);
+makeChart("kneeChart",  t_ms, kneeArr);
+makeChart("ankleChart", t_ms, ankleArr);
 
-// Quy tắc FMA (demo)
+// ====== EMG CHART (3 đường) ======
+(function makeEmgChart(){
+  const el = document.getElementById("emgChart");
+  if (!el) return;
+
+  // Nếu không có EMG thì hiện chart rỗng (không crash)
+  const hasAny = (emgArr && emgArr.length) || (emgRmsArr && emgRmsArr.length) || (emgEnvArr && emgEnvArr.length);
+  const labels = t_ms;
+
+  const ds = [];
+  if (emgArr && emgArr.length) {
+    ds.push({ label:"raw", data: emgArr, borderWidth:1.5, tension:0.15 });
+  }
+  if (emgRmsArr && emgRmsArr.length) {
+    ds.push({ label:"rms", data: emgRmsArr, borderWidth:2, tension:0.15 });
+  }
+  if (emgEnvArr && emgEnvArr.length) {
+    ds.push({ label:"env", data: emgEnvArr, borderWidth:2, tension:0.15 });
+  }
+
+  new Chart(el, {
+    type: "line",
+    data: { labels, datasets: ds },
+    options: {
+      responsive:true,
+      maintainAspectRatio:false,
+      interaction:{ mode:"index", intersect:false },
+      plugins:{ legend:{ display:true }},
+      scales:{
+        x:{ title:{ display:true, text:"t (ms)" }},
+        y:{ title:{ display:true, text:"EMG (a.u.)" } }
+      }
+    }
+  });
+
+  if (!hasAny) {
+    console.warn("EMG is empty. Check route /charts to pass emg/emg_rms/emg_env.");
+  }
+})();
+
+// ====== FMA (demo) ======
+const evalBox = document.getElementById("evalContent");
+const totalScoreSpan = document.getElementById("totalScore");
+
 function fmaScore(rom){
   if (rom >= 90) return 2;
-  if (rom >= 40 && rom<=50) return 1;
+  if (rom >= 40 && rom <= 50) return 1;
   return 0;
 }
-
-// Chuyển điểm FMA -> nhận xét cơ gối, đa ngôn ngữ
 function strengthInfo(score){
   score = Number(score) || 0;
   const T = STRENGTH_TEXT[CURRENT_LANG] || STRENGTH_TEXT.vi;
-
-  if (score >= 2){
-    return {
-      label: T.good_label,
-      desc : T.good_desc,
-      badgeClass: "bg-success"
-    };
-  }
-  if (score === 1){
-    return {
-      label: T.mid_label,
-      desc : T.mid_desc,
-      badgeClass: "bg-warning text-dark"
-    };
-  }
-  return {
-    label: T.weak_label,
-    desc : T.weak_desc,
-    badgeClass: "bg-danger"
-  };
+  if (score >= 2) return { label:T.good_label, desc:T.good_desc, badgeClass:"bg-success" };
+  if (score === 1) return { label:T.mid_label,  desc:T.mid_desc,  badgeClass:"bg-warning text-dark" };
+  return { label:T.weak_label, desc:T.weak_desc, badgeClass:"bg-danger" };
 }
 
-// ====== LẤY ĐIỂM ĐÃ LƯU TỪ LOCALSTORAGE ======
+// ====== Scores localStorage ======
 let storedScores = {};
-try {
-  storedScores = JSON.parse(localStorage.getItem("exerciseScores") || "{}");
-} catch(e) {
-  storedScores = {};
-}
+try { storedScores = JSON.parse(localStorage.getItem("exerciseScores") || "{}"); }
+catch(e){ storedScores = {}; }
 
-const defaultOrder = ["ankle flexion","knee flexion","hip flexion"];
+const defaultOrder  = ["ankle flexion","knee flexion","hip flexion"];
 const exerciseOrder = Array.from(new Set([...defaultOrder, ...Object.keys(storedScores)]));
 
 function showCurrentExerciseScore(){
@@ -4256,10 +4171,10 @@ function showCurrentExerciseScore(){
       totalScoreSpan.textContent = "0 / 2";
       return;
     }
-
     const maxK = Math.max(...kneeArr);
     const minK = Math.min(...kneeArr);
     const rom  = maxK - minK;
+
     const score = fmaScore(rom);
     const info  = strengthInfo(score);
 
@@ -4269,39 +4184,20 @@ function showCurrentExerciseScore(){
         <div class="fma-note-box p-3 my-2">
           <div class='strength-desc mb-0'>${info.desc}</div>
         </div>
-      </div>
-    `;
-
+      </div>`;
     totalScoreSpan.textContent = `${score} / 2`;
     totalScoreSpan.className = "badge ms-1 " + info.badgeClass;
     return;
   }
 
-  const romKnee = Number(data.romKnee || 0);
-
-  let maxK, minK;
-  if (typeof data.maxKnee === "number" && typeof data.minKnee === "number") {
-    maxK = data.maxKnee;
-    minK = data.minKnee;
-  } else if (kneeArr.length) {
-    maxK = Math.max(...kneeArr);
-    minK = Math.min(...kneeArr);
-  } else {
-    maxK = romKnee;
-    minK = 0;
-  }
-
   const info = strengthInfo(data.score);
-
   evalBox.innerHTML = `
     <div class='eval-item'>
       <div class='strength-label mb-1'>${info.label}</div>
       <div class="fma-note-box p-3 my-2">
         <div class='strength-desc mb-0'>${info.desc}</div>
       </div>
-    </div>
-  `;
-
+    </div>`;
   totalScoreSpan.textContent = `${data.score} / 2`;
   totalScoreSpan.className = "badge ms-1 " + info.badgeClass;
 }
@@ -4321,19 +4217,17 @@ function renderAllExercisesSummary(){
   let html = "";
   let total = 0;
 
-  const sortedNames = [...keys].sort((a, b) => {
-    const ia = defaultOrder.indexOf(a);
-    const ib = defaultOrder.indexOf(b);
+  const sortedNames = [...keys].sort((a,b)=>{
+    const ia = defaultOrder.indexOf(a), ib = defaultOrder.indexOf(b);
     if (ia === -1 && ib === -1) return a.localeCompare(b);
     if (ia === -1) return 1;
     if (ib === -1) return -1;
     return ia - ib;
   });
 
-  sortedNames.forEach((name, idx) => {
+  sortedNames.forEach((name, idx)=>{
     const d = storedScores[name];
     if (!d) return;
-
     total += d.score || 0;
     const info = strengthInfo(d.score);
 
@@ -4343,142 +4237,99 @@ function renderAllExercisesSummary(){
           <div>
             <div class='fw-semibold'>${idx+1}. ${name}</div>
             <div class='small text-muted'>
-              ROM Knee: ${(d.romKnee || 0).toFixed(1)}°
+              ROM Knee: ${(Number(d.romKnee||0)).toFixed(1)}°
               – <span class='strength-label'>${info.label}</span>
             </div>
           </div>
           <span class='eval-badge badge ${info.badgeClass}'>${d.score} / 2</span>
         </div>
-      </div>
-    `;
+      </div>`;
   });
 
   html += `
     <div class='total-summary'>
       ${T.total_all}
       <span>${total} / ${sortedNames.length * 2}</span>
-    </div>
-  `;
-
+    </div>`;
   allSummaryDiv.innerHTML = html;
 }
 
 showCurrentExerciseScore();
 renderAllExercisesSummary();
 
-const btnNext = document.getElementById("btnNextEx");
-
-btnNext.onclick = () => {
+// ===== Next exercise =====
+document.getElementById("btnNextEx").onclick = () => {
   const T = TEXT[CURRENT_LANG] || TEXT.vi;
   const idx = exerciseOrder.indexOf(currentExerciseName);
 
   if (idx >= 0 && idx < exerciseOrder.length - 1){
     const nextName = exerciseOrder[idx + 1];
-
     let url = "/?next_ex=" + encodeURIComponent(nextName);
-    if (patientCode) {
-      url += "&patient_code=" + encodeURIComponent(patientCode);
-    }
-
+    if (patientCode) url += "&patient_code=" + encodeURIComponent(patientCode);
     window.location.href = url;
     return;
   }
 
   let url = "/";
-  if (patientCode) {
-    url += "?patient_code=" + encodeURIComponent(patientCode);
-  }
+  if (patientCode) url += "?patient_code=" + encodeURIComponent(patientCode);
   alert(T.finished_all);
   window.location.href = url;
 };
 </script>
+
 </body>
 </html>
 """
-
-
-EMG_CHART_HTML = """<!doctype html>
-<html lang="vi"><head>
+EMG_CHART_HTML = r"""<!doctype html>
+<html lang="vi">
+<head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Biểu đồ EMG</title>
+<title data-i18n="emg.page_title">Biểu đồ EMG</title>
 
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
 <style>
 :root { --blue:#1669c9; --sbw:260px; }
-
-body{
-  background:#e8f3ff;
-  margin:0;
-}
-
+body{ background:#e8f3ff; margin:0; }
 .layout{ display:flex; gap:16px; position:relative; }
 
-.sidebar-col{
-  flex:0 0 var(--sbw);
-  max-width:var(--sbw);
-  transition:all .28s ease;
-}
+.sidebar-col{ flex:0 0 var(--sbw); max-width:var(--sbw); transition:all .28s ease; }
 .sidebar{
   background:var(--blue); color:#fff;
-  border-top-right-radius:16px;
-  border-bottom-right-radius:16px;
-  padding:16px;
-  min-height:100vh;
+  border-top-right-radius:16px; border-bottom-right-radius:16px;
+  padding:16px; min-height:100vh;
 }
 .main-col{ flex:1 1 auto; min-width:0; }
 
-body.sb-collapsed .sidebar-col{
-  flex-basis:0 !important;
-  max-width:0 !important;
-}
-body.sb-collapsed .sidebar{
-  padding:0 !important;
-}
-body.sb-collapsed .sidebar *{
-  display:none;
-}
+body.sb-collapsed .sidebar-col{ flex-basis:0 !important; max-width:0 !important; }
+body.sb-collapsed .sidebar{ padding:0 !important; }
+body.sb-collapsed .sidebar *{ display:none; }
 
 #btnToggleSB{
-  border:2px solid #d8e6ff;
-  background:#fff;
-  border-radius:10px;
-  padding:6px 10px;
-  font-weight:700;
+  border:2px solid #d8e6ff; background:#fff;
+  border-radius:10px; padding:6px 10px; font-weight:700;
 }
-#btnToggleSB:hover{
-  background:#eef6ff;
-}
+#btnToggleSB:hover{ background:#eef6ff; }
 
 .menu-btn{
-  width:100%;
-  display:block;
-  background:#1d74d8;
-  border:none;
-  color:#fff;
-  padding:10px 12px;
-  margin:8px 0;
-  border-radius:12px;
-  font-weight:600;
-  text-align:left;
-  text-decoration:none;
+  width:100%; display:block; background:#1d74d8; border:none; color:#fff;
+  padding:10px 12px; margin:8px 0; border-radius:12px;
+  font-weight:600; text-align:left; text-decoration:none;
 }
 .menu-btn:hover{ background:#1f80ea; }
 .menu-btn.active{ background:#0f5bb0; }
 
 .panel{
-  background:#fff;
-  border-radius:16px;
+  background:#fff; border-radius:16px;
   box-shadow:0 8px 20px rgba(16,24,40,0.10);
-  padding:16px;
-  margin-bottom:16px;
+  padding:16px; margin-bottom:16px;
 }
-
 .chart-box{ height:420px; }
 </style>
 </head>
+
 <body class="sb-collapsed">
 
 <nav class="navbar bg-white shadow-sm px-3">
@@ -4496,12 +4347,12 @@ body.sb-collapsed .sidebar *{
     <aside class="sidebar-col">
       <div class="sidebar">
         <div class="mb-2 fw-bold" data-i18n="menu.title">MENU</div>
-        <a class="menu-btn" href="/"                 data-i18n="menu.home">Trang chủ</a>
-        <a class="menu-btn" href="/calibration"      data-i18n="menu.calib">Hiệu chuẩn</a>
-        <a class="menu-btn" href="/patients/manage"  data-i18n="menu.patinfo">Thông tin bệnh nhân</a>
-        <a class="menu-btn" href="/charts"           data-i18n="menu.charts">Biểu đồ</a>
-        <a class="menu-btn active" href="/charts_emg"data-i18n="menu.emg">Biểu đồ EMG</a>
-        <a class="menu-btn" href="/settings"         data-i18n="menu.settings">Cài đặt</a>
+        <a class="menu-btn" href="/"                  data-i18n="menu.home">Trang chủ</a>
+        <a class="menu-btn" href="/calibration"       data-i18n="menu.calib">Hiệu chuẩn</a>
+        <a class="menu-btn" href="/patients/manage"   data-i18n="menu.patinfo">Thông tin bệnh nhân</a>
+        <a class="menu-btn" href="/charts"            data-i18n="menu.charts">Biểu đồ</a>
+        <a class="menu-btn active" href="/charts_emg" data-i18n="menu.emg">Biểu đồ EMG</a>
+        <a class="menu-btn" href="/settings"          data-i18n="menu.settings">Cài đặt</a>
       </div>
     </aside>
 
@@ -4511,7 +4362,7 @@ body.sb-collapsed .sidebar *{
           <div>
             <h5 data-i18n="emg.title">Biểu đồ tín hiệu EMG</h5>
             <div class="text-muted small" data-i18n="emg.subtitle">
-              Biên độ EMG theo thời gian (mV). Dùng cùng thời gian với phiên đo gần nhất.
+              EMG (raw/RMS/envelope) theo thời gian – hiển thị 6 giây cuối của phiên đo gần nhất.
             </div>
           </div>
           <a class="btn btn-outline-primary btn-sm" href="/charts" data-i18n="emg.back">← Biểu đồ góc khớp</a>
@@ -4522,6 +4373,7 @@ body.sb-collapsed .sidebar *{
         <div class="chart-box">
           <canvas id="emgChart"></canvas>
         </div>
+        <div class="small text-muted mt-2" id="hintBox"></div>
       </div>
     </main>
   </div>
@@ -4531,27 +4383,17 @@ body.sb-collapsed .sidebar *{
 // I18N cho trang EMG
 const I18N_EMG = {
   vi:{
-    "menu.title":"MENU",
-    "menu.home":"Trang chủ",
-    "menu.calib":"Hiệu chuẩn",
-    "menu.patinfo":"Thông tin bệnh nhân",
-    "menu.charts":"Biểu đồ",
-    "menu.emg":"Biểu đồ EMG",
-    "menu.settings":"Cài đặt",
+    "menu.title":"MENU","menu.home":"Trang chủ","menu.calib":"Hiệu chuẩn","menu.patinfo":"Thông tin bệnh nhân",
+    "menu.charts":"Biểu đồ","menu.emg":"Biểu đồ EMG","menu.settings":"Cài đặt",
     "emg.title":"Biểu đồ tín hiệu EMG",
-    "emg.subtitle":"Biên độ EMG theo thời gian (mV). Dùng cùng thời gian với phiên đo gần nhất.",
+    "emg.subtitle":"EMG (raw/RMS/envelope) theo thời gian – hiển thị 6 giây cuối của phiên đo gần nhất.",
     "emg.back":"← Biểu đồ góc khớp"
   },
   en:{
-    "menu.title":"MENU",
-    "menu.home":"Home",
-    "menu.calib":"Calibration",
-    "menu.patinfo":"Patient info",
-    "menu.charts":"Angle charts",
-    "menu.emg":"EMG charts",
-    "menu.settings":"Settings",
+    "menu.title":"MENU","menu.home":"Home","menu.calib":"Calibration","menu.patinfo":"Patient info",
+    "menu.charts":"Angle charts","menu.emg":"EMG charts","menu.settings":"Settings",
     "emg.title":"EMG signal chart",
-    "emg.subtitle":"EMG amplitude over time (mV), aligned with last measurement session.",
+    "emg.subtitle":"EMG (raw/RMS/envelope) over time – show last 6 seconds of the latest session.",
     "emg.back":"← Joint angle charts"
   }
 };
@@ -4564,38 +4406,127 @@ function applyLangEmg(lang){
 }
 document.addEventListener("DOMContentLoaded", ()=>{
   const lang = localStorage.getItem("appLang") || "vi";
+  document.documentElement.lang = lang;
   applyLangEmg(lang);
 });
-
 document.getElementById("btnToggleSB").onclick = () =>
   document.body.classList.toggle("sb-collapsed");
+</script>
 
-const t_ms  = {{ t_ms|tojson }};
-const emg   = {{ emg|tojson }};
+<script>
+/* ===== DATA FROM SERVER (Jinja) ===== */
+const t_ms_raw    = {{ (t_ms    or []) | tojson }};
+const hip_raw     = {{ (hip     or []) | tojson }};
+const knee_raw    = {{ (knee    or []) | tojson }};
+const ankle_raw   = {{ (ankle   or []) | tojson }};
 
-const options = {
-  responsive:true, maintainAspectRatio:false,
-  interaction:{ mode:"index", intersect:false },
-  plugins:{ legend:{ display:false }},
-  scales:{
-    x:{ title:{ display:true, text:"t (ms)" }},
-    y:{ title:{ display:true, text:"Biên độ EMG (mV)" } }
-  }
+const emg_raw     = {{ (emg     or []) | tojson }};
+const emg_rms_raw = {{ (emg_rms or []) | tojson }};
+const emg_env_raw = {{ (emg_env or []) | tojson }};
+
+/* ✅ EXPOSE TO WINDOW (để Console thấy) */
+window.t_ms_raw = t_ms_raw;
+window.hip_raw = hip_raw;
+window.knee_raw = knee_raw;
+window.ankle_raw = ankle_raw;
+
+window.emg_raw = emg_raw;
+window.emg_rms_raw = emg_rms_raw;
+window.emg_env_raw = emg_env_raw;
+
+/* ✅ DEBUG HELPER */
+window._dbg = function(){
+  return {
+    t_len: (window.t_ms_raw||[]).length,
+    hip_len: (window.hip_raw||[]).length,
+    emg_len: (window.emg_raw||[]).length,
+    rms_len: (window.emg_rms_raw||[]).length,
+    env_len: (window.emg_env_raw||[]).length,
+    t_first: (window.t_ms_raw||[])[0],
+    t_last:  (window.t_ms_raw||[]).at ? (window.t_ms_raw||[]).at(-1) : (window.t_ms_raw||[])[(window.t_ms_raw||[]).length-1],
+  };
 };
+
+/* ✅ LOG NGAY KHI LOAD (để khỏi phải gõ) */
+console.log("[DBG] injected:", window._dbg());
+</script>
+
+
+<script>
+// ===== CLIP 6s CUỐI =====
+const WINDOW_MS = 6000;
+
+let t_ms     = (t_ms_raw    || []).slice();
+let emgArr   = (emg_raw     || []).slice();
+let emgRms   = (emg_rms_raw || []).slice();
+let emgEnv   = (emg_env_raw || []).slice();
+
+(function clipLastWindow(){
+  if (!t_ms.length) return;
+  const lastT = t_ms[t_ms.length - 1];
+  const minT  = lastT - WINDOW_MS;
+
+  let startIdx = 0;
+  while (startIdx < t_ms.length && t_ms[startIdx] < minT) startIdx++;
+
+  if (startIdx > 0 && startIdx < t_ms.length) {
+    t_ms = t_ms.slice(startIdx);
+
+    // chỉ slice nếu length align với t_ms_raw (an toàn)
+    if (emgArr.length === t_ms_raw.length) emgArr = emgArr.slice(startIdx);
+    if (emgRms.length === t_ms_raw.length) emgRms = emgRms.slice(startIdx);
+    if (emgEnv.length === t_ms_raw.length) emgEnv = emgEnv.slice(startIdx);
+  }
+})();
+
+// ===== DEBUG HELPER (gõ _dbg() trong console) =====
+window._dbg = () => ({
+  url: location.pathname,
+  t_len: t_ms.length,
+  emg_len: emgArr.length,
+  rms_len: emgRms.length,
+  env_len: emgEnv.length,
+  last_t: t_ms.length ? t_ms[t_ms.length-1] : null
+});
+
+// ===== DRAW CHART =====
+const lang = localStorage.getItem("appLang") || "vi";
+const AXIS = {
+  vi: { x:"t (ms)", y:"EMG (a.u.)", empty:"Không có dữ liệu EMG. Kiểm tra route /charts_emg có truyền emg/emg_rms/emg_env và t_ms." },
+  en: { x:"t (ms)", y:"EMG (a.u.)", empty:"No EMG data. Check /charts_emg passes emg/emg_rms/emg_env and t_ms." }
+}[lang] || { x:"t (ms)", y:"EMG (a.u.)", empty:"No EMG data." };
+
+const hintBox = document.getElementById("hintBox");
+
+const datasets = [];
+if (emgArr && emgArr.length) datasets.push({ label:"raw", data: emgArr, borderWidth:1.5, tension:0.15 });
+if (emgRms && emgRms.length) datasets.push({ label:"rms", data: emgRms, borderWidth:2, tension:0.15 });
+if (emgEnv && emgEnv.length) datasets.push({ label:"env", data: emgEnv, borderWidth:2, tension:0.15 });
+
+if (!t_ms.length || !datasets.length) {
+  hintBox.textContent = AXIS.empty;
+  console.warn(AXIS.empty, window._dbg());
+}
 
 new Chart(document.getElementById("emgChart"), {
   type:"line",
-  data:{
-    labels:t_ms,
-    datasets:[{ data:emg, borderColor:"#1973d4", tension:0.15 }]
-  },
-  options
+  data:{ labels: t_ms, datasets },
+  options:{
+    responsive:true, maintainAspectRatio:false,
+    interaction:{ mode:"index", intersect:false },
+    plugins:{ legend:{ display:true } },
+    scales:{
+      x:{ title:{ display:true, text: AXIS.x } },
+      y:{ title:{ display:true, text: AXIS.y } }
+    }
+  }
 });
 </script>
 
 </body>
 </html>
 """
+
 
 # ===================== Patients Manage =====================
 PATIENTS_MANAGE_HTML = """
