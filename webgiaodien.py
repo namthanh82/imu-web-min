@@ -73,8 +73,7 @@ LOGIN_HTML = """<!doctype html><html><body>
 {% if error_message %}<p style="color:red">{{error_message}}</p>{% endif %}
 </body></html>"""
 
-# ⚠️ Bạn đang có DASH_HTML rất dài — giữ nguyên bản bạn đang dùng.
-# Ở đây chỉ placeholder để file chạy được.
+
 DASH_HTML = """<!doctype html><html><body>
 <h3>Dashboard placeholder</h3>
 <p>Xin chào, {{username}}</p>
@@ -496,7 +495,7 @@ def load_user(u):
 # =========================
 EXERCISE_VIDEOS = {
     "ankle flexion": "/static/videos/ankle_flexion.mp4",
-    "knee flexion":  "/static/knee flexion.mp4",
+    "knee flexion":  "/static/videos/knee_flexion.mp4",
     "hip flexion":   "/static/videos/hip_flexion.mp4",
 }
 
@@ -2695,7 +2694,7 @@ scene.add(legPivot);
 window.legPivot = legPivot;
 
 const loader = new GLTFLoader();
-const GLB_URL = "{{ url_for('static', filename='leg_model.glb') }}";
+const GLB_URL = "{{ url_for('static', filename='models/leg_model.glb') }}";
 
 loader.load(
   GLB_URL,
@@ -2855,31 +2854,53 @@ if (btnStop) btnStop.disabled = true;
 
 // ===== GIẢ LẬP NHỊP TIM – chỉ chạy khi đang đo =====
 let heartSimTimer = null;
-let heartVal = 75;
-let heartDir = 1;
+let heartVal = 95;     // giá trị trung tâm
+let heartTarget = 102; // mục tiêu tiếp theo
 
 function startHeartSim(){
   const el = document.getElementById("heartRate");
   if (!el) return;
   if (heartSimTimer) return;
 
-  const MIN = 70;
-  const MAX = 95;
+  const MIN = 82;
+  const MAX = 110;
+
+  function pickNewTarget(){
+    // chọn mục tiêu mới nhưng không nhảy quá xa
+    const delta = (Math.random() * 6 + 2); // 2 → 8 bpm
+    const dir = Math.random() > 0.5 ? 1 : -1;
+    let t = heartVal + dir * delta;
+
+    // clamp
+    if (t > MAX) t = MAX - Math.random() * 3;
+    if (t < MIN) t = MIN + Math.random() * 3;
+
+    return t;
+  }
 
   function step(){
     if (!isMeasuring){
       heartSimTimer = null;
       return;
     }
-    heartVal += heartDir * (Math.random() * 1.5 + 0.5);
-    if (heartVal >= MAX){ heartVal = MAX; heartDir = -1; }
-    if (heartVal <= MIN){ heartVal = MIN; heartDir = 1; }
-    el.value = heartVal.toFixed(0);
-    heartSimTimer = setTimeout(step, Math.random()*400 + 300);
+
+    // Nếu gần target rồi → chọn target mới
+    if (Math.abs(heartVal - heartTarget) < 0.4){
+      heartTarget = pickNewTarget();
+    }
+
+    // Tiến dần về target (rất mượt)
+    heartVal += (heartTarget - heartVal) * 0.12;
+
+    el.value = Math.round(heartVal);
+
+    // cập nhật chậm như tim thật
+    heartSimTimer = setTimeout(step, 550 + Math.random() * 300);
   }
 
-  heartVal = 75;
-  heartDir = 1;
+  // khởi tạo
+  heartVal = 90 + Math.random() * 4 - 2;
+  heartTarget = pickNewTarget();
   step();
 }
 
@@ -2889,6 +2910,7 @@ function stopHeartSim(){
     heartSimTimer = null;
   }
 }
+
 
 // ====== HÀM CHẤM ĐIỂM FMA (0–2) theo ROM Knee ======
 function fmaScore(rom){
@@ -3272,12 +3294,14 @@ if (btnSave) btnSave.addEventListener("click", async () => {
 
 /* ========== SOCKET IO – cập nhật EMG + góc & thu mẫu ========== */
 window.socket = window.socket || io({
-  transports: ['websocket'],
+  transports: ['polling'],      // ✅ ép polling để khỏi “transport close”
   upgrade: false,
   reconnection: true,
-  reconnectionAttempts: 10,
-  reconnectionDelay: 500
+  reconnectionAttempts: Infinity,
+  reconnectionDelay: 500,
+  timeout: 20000
 });
+
 
 const socket = window.socket;
 socket.on('connect', () => console.log('[SOCKET] connected:', socket.id));
@@ -4944,7 +4968,6 @@ if __name__ == "__main__":
         debug=True,
         allow_unsafe_werkzeug=True
     )
-
 
 
 
