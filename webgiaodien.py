@@ -496,7 +496,7 @@ def load_user(u):
 # =========================
 EXERCISE_VIDEOS = {
     "ankle flexion": "/static/videos/ankle_flexion.mp4",
-    "knee flexion":  "/static/videos/knee_flexion.mp4",
+    "knee flexion":  "/static/knee_flexion.mp4",
     "hip flexion":   "/static/videos/hip_flexion.mp4",
 }
 
@@ -2695,7 +2695,7 @@ scene.add(legPivot);
 window.legPivot = legPivot;
 
 const loader = new GLTFLoader();
-const GLB_URL = "{{ url_for('static', filename='models/leg_model.glb') }}";
+const GLB_URL = "{{ url_for('static', filename='leg_model.glb') }}";
 
 loader.load(
   GLB_URL,
@@ -4944,6 +4944,7 @@ if __name__ == "__main__":
         debug=True,
         allow_unsafe_werkzeug=True
     )
+
 
 
 
