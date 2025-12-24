@@ -2866,15 +2866,12 @@ function startHeartSim(){
   const MAX = 110;
 
   function pickNewTarget(){
-    // chọn mục tiêu mới nhưng không nhảy quá xa
-    const delta = (Math.random() * 6 + 2); // 2 → 8 bpm
+    const delta = Math.floor(Math.random() * 10 + 3); // 3 → 12 bpm
     const dir = Math.random() > 0.5 ? 1 : -1;
     let t = heartVal + dir * delta;
 
-    // clamp
-    if (t > MAX) t = MAX - Math.random() * 3;
-    if (t < MIN) t = MIN + Math.random() * 3;
-
+    if (t > MAX) t = MAX;
+    if (t < MIN) t = MIN;
     return t;
   }
 
@@ -2884,22 +2881,31 @@ function startHeartSim(){
       return;
     }
 
-    // Nếu gần target rồi → chọn target mới
-    if (Math.abs(heartVal - heartTarget) < 0.4){
+    // nếu gần target → đổi target mới
+    if (Math.abs(heartVal - heartTarget) <= 1){
       heartTarget = pickNewTarget();
     }
 
-    // Tiến dần về target (rất mượt)
-    heartVal += (heartTarget - heartVal) * 0.12;
+    // 🔥 bước nhảy rời rạc 1 / 2 / 3 bpm
+    const jump = [1, 2, 3][Math.floor(Math.random() * 3)];
 
-    el.value = Math.round(heartVal);
+    if (heartVal < heartTarget){
+      heartVal += jump;
+    } else if (heartVal > heartTarget){
+      heartVal -= jump;
+    }
 
-    // cập nhật chậm như tim thật
-    heartSimTimer = setTimeout(step, 550 + Math.random() * 300);
+    // clamp an toàn
+    heartVal = Math.max(MIN, Math.min(MAX, heartVal));
+
+    el.value = heartVal;
+
+    // ⏱ nhịp tim tự nhiên
+    heartSimTimer = setTimeout(step, 2000 + Math.random() * 1200);
   }
 
-  // khởi tạo
-  heartVal = 90 + Math.random() * 4 - 2;
+  // init
+  heartVal = 88 + Math.floor(Math.random() * 6);
   heartTarget = pickNewTarget();
   step();
 }
@@ -2910,6 +2916,7 @@ function stopHeartSim(){
     heartSimTimer = null;
   }
 }
+
 
 
 // ====== HÀM CHẤM ĐIỂM FMA (0–2) theo ROM Knee ======
@@ -3826,7 +3833,7 @@ body.sb-collapsed .sidebar *{ display:none; }
 
           <!-- ✅ EMG CHART (raw/rms/env) ngay trong /charts -->
           <div class="panel">
-            <h6 class="mb-2">EMG (raw / RMS / envelope) – 6s cuối</h6>
+            <h6 class="mb-2">EMG (raw / RMS / envelope) </h6>
             <div class="chart-box"><canvas id="emgChart"></canvas></div>
             <div class="small text-muted mt-2">
               Nếu đường EMG không hiện: kiểm tra route /charts đã truyền emg/emg_rms/emg_env và dữ liệu có cùng chiều với t_ms.
@@ -4104,12 +4111,24 @@ const commonOptions = {
 function makeChart(canvasId, labels, yArr){
   const el = document.getElementById(canvasId);
   if (!el) return;
+
   new Chart(el, {
-    type:"line",
-    data:{ labels, datasets:[{ data:yArr, borderWidth:2, tension:0.15 }]},
+    type: "line",
+    data: {
+      labels,
+      datasets: [{
+        data: yArr,
+        borderWidth: 1,       // mỏng nét
+        tension: 0.15,
+        pointRadius: 0,       // tắt chấm
+        pointHitRadius: 6,    // vẫn dễ hover
+        pointHoverRadius: 2,  // chấm nhỏ khi hover
+      }]
+    },
     options: commonOptions
   });
 }
+
 
 makeChart("hipChart",   t_ms, hipArr);
 makeChart("kneeChart",  t_ms, kneeArr);
@@ -4125,15 +4144,16 @@ makeChart("ankleChart", t_ms, ankleArr);
   const labels = t_ms;
 
   const ds = [];
-  if (emgArr && emgArr.length) {
-    ds.push({ label:"raw", data: emgArr, borderWidth:1.5, tension:0.15 });
-  }
-  if (emgRmsArr && emgRmsArr.length) {
-    ds.push({ label:"rms", data: emgRmsArr, borderWidth:2, tension:0.15 });
-  }
-  if (emgEnvArr && emgEnvArr.length) {
-    ds.push({ label:"env", data: emgEnvArr, borderWidth:2, tension:0.15 });
-  }
+if (emgArr && emgArr.length) {
+  ds.push({ label:"raw", data: emgArr, borderWidth: 1, tension: 0.15, pointRadius: 0 });
+}
+if (emgRmsArr && emgRmsArr.length) {
+  ds.push({ label:"rms", data: emgRmsArr, borderWidth: 1.2, tension: 0.15, pointRadius: 0 });
+}
+if (emgEnvArr && emgEnvArr.length) {
+  ds.push({ label:"env", data: emgEnvArr, borderWidth: 1.5, tension: 0.15, pointRadius: 0 });
+}
+
 
   new Chart(el, {
     type: "line",
@@ -4480,30 +4500,31 @@ console.log("[DBG] injected:", window._dbg());
 
 <script>
 // ===== CLIP 6s CUỐI =====
-const WINDOW_MS = 6000;
-
-let t_ms     = (t_ms_raw    || []).slice();
-let emgArr   = (emg_raw     || []).slice();
-let emgRms   = (emg_rms_raw || []).slice();
-let emgEnv   = (emg_env_raw || []).slice();
+// ===== CLIP 12–15 GIÂY CUỐI (t_ms của bạn đang là GIÂY) =====
+const WINDOW_SEC = 5; // đổi 12 hoặc 15 tùy bạn
 
 (function clipLastWindow(){
   if (!t_ms.length) return;
-  const lastT = t_ms[t_ms.length - 1];
-  const minT  = lastT - WINDOW_MS;
+
+  const lastT = t_ms[t_ms.length - 1];  // đơn vị: giây
+  const minT  = lastT - WINDOW_SEC;
 
   let startIdx = 0;
   while (startIdx < t_ms.length && t_ms[startIdx] < minT) startIdx++;
 
   if (startIdx > 0 && startIdx < t_ms.length) {
-    t_ms = t_ms.slice(startIdx);
+    t_ms     = t_ms.slice(startIdx);
+    hipArr   = hipArr.slice(startIdx);
+    kneeArr  = kneeArr.slice(startIdx);
+    ankleArr = ankleArr.slice(startIdx);
 
-    // chỉ slice nếu length align với t_ms_raw (an toàn)
-    if (emgArr.length === t_ms_raw.length) emgArr = emgArr.slice(startIdx);
-    if (emgRms.length === t_ms_raw.length) emgRms = emgRms.slice(startIdx);
-    if (emgEnv.length === t_ms_raw.length) emgEnv = emgEnv.slice(startIdx);
+    // EMG: nếu cùng chiều với t_ms_raw thì slice theo index
+    if (emgArr.length === t_ms_raw.length)    emgArr    = emgArr.slice(startIdx);
+    if (emgRmsArr.length === t_ms_raw.length) emgRmsArr = emgRmsArr.slice(startIdx);
+    if (emgEnvArr.length === t_ms_raw.length) emgEnvArr = emgEnvArr.slice(startIdx);
   }
 })();
+
 
 // ===== DEBUG HELPER (gõ _dbg() trong console) =====
 window._dbg = () => ({
