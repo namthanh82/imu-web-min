@@ -2927,15 +2927,17 @@ function getExerciseRegion(){
 const emgCard = document.getElementById("emgCard");
 
 function isEmgEnabled(){
-  const ex = (getCurrentExerciseName() || "").toLowerCase();
-  return ex.includes("knee"); // 
+  return true; 
 }
+
 
 /*  FIX LỖI: trước đây gọi syncEmgVisibility nhưng chưa định nghĩa */
 function syncEmgVisibility(){
-  if (!emgCard) return;
-  emgCard.classList.toggle("emg-hidden", !isEmgEnabled());
+  const card = document.getElementById("emgCard");
+  if (!card) return;
+  card.classList.remove("emg-hidden"); // luôn hiện
 }
+
 
 /* đổi bài tập -> reset + sync */
 exerciseSelect?.addEventListener("change", ()=>{
