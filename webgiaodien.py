@@ -495,7 +495,7 @@ def load_user(u):
 # =========================
 EXERCISE_VIDEOS = {
     "ankle flexion": "/static/videos/ankle_flexion.mp4",
-    "knee flexion":  "/static/videos/knee_flexion.mp4",
+    "knee flexion":  "/static/knee_flexion.mp4",
     "hip flexion":   "/static/videos/hip_flexion.mp4",
 }
 
@@ -553,7 +553,7 @@ def session_start():
     reset_max_angles()
 
     if SERIAL_ENABLED:
-        port = os.environ.get("SERIAL_PORT") or "COM7"
+        port = os.environ.get("SERIAL_PORT") or "/dev/ttyUSB0"
         baud = int(os.environ.get("SERIAL_BAUD", "115200"))
         ok = start_serial_reader(port=port, baud=baud)
         if not ok:
@@ -4989,6 +4989,7 @@ if __name__ == "__main__":
         debug=True,
         allow_unsafe_werkzeug=True
     )
+
 
 
 
