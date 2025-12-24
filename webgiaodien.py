@@ -496,7 +496,7 @@ def load_user(u):
 # =========================
 EXERCISE_VIDEOS = {
     "ankle flexion": "/static/videos/ankle_flexion.mp4",
-    "knee flexion":  "/static/knee_flexion.mp4",
+    "knee flexion":  "/static/knee flexion.mp4",
     "hip flexion":   "/static/videos/hip_flexion.mp4",
 }
 
@@ -4944,6 +4944,7 @@ if __name__ == "__main__":
         debug=True,
         allow_unsafe_werkzeug=True
     )
+
 
 
 
