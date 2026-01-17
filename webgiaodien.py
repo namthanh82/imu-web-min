@@ -183,11 +183,11 @@ def parse_serial_line(line: str):
             pitch = float(parts[5])
             return ("imu", sender_id, ts, yaw, roll, pitch)
 
-        if tag == "EMG" and len(parts) >= 4:
-            sender_id = int(parts[1])
-            ts_us = int(float(parts[2]))
-            emg_clean = float(parts[3])
-            return ("emg", sender_id, ts_us, emg_clean)
+        #if tag == "EMG" and len(parts) >= 4:
+            #sender_id = int(parts[1])
+            #ts_us = int(float(parts[2]))
+            #emg_clean = float(parts[3])
+            #return ("emg", sender_id, ts_us, emg_clean)
     except Exception:
         return None
 
@@ -302,19 +302,19 @@ def start_serial_reader(port=None, baud=115200):
                         "pitch2": pitch2
                     }])
 
-                elif ptype == "emg":
-                    _, sender_id, ts_us, emg_clean = parsed
-                    emg_rect = abs(float(emg_clean))
+                #elif ptype == "emg":
+                    #_, sender_id, ts_us, emg_clean = parsed
+                    #emg_rect = abs(float(emg_clean))
 
-                    emg_entry = {
-                        "v": emg_rect,
-                        "t_ms": now_ms,
-                        "sender_id": int(sender_id)
-                    }
+                    #emg_entry = {
+                        #"v": emg_rect,
+                        #"t_ms": now_ms,
+                        #"sender_id": int(sender_id)
+                    #}
 
-                    with EMG_LOCK:
-                        EMG_BUF.append(emg_rect)
-                        LAST_EMG["emg"] = emg_entry
+                    #with EMG_LOCK:
+                        #EMG_BUF.append(emg_rect)
+                        #LAST_EMG["emg"] = emg_entry
 
             except Exception as e:
                 # nếu port bị rút ra hoặc bị close, thoát vòng lặp
@@ -382,31 +382,31 @@ def append_samples(samples):
             }
 
         # ---- sync EMG: lấy LAST_EMG gần nhất theo host-time
-        emg_v = None
-        emg_id = None
+        #emg_v = None
+        #emg_id = None
 
-        with EMG_LOCK:
-            emg = LAST_EMG.get("emg")
+        #with EMG_LOCK:
+            #emg = LAST_EMG.get("emg")
 
-        if emg:
-            try:
-                emg_id = int(emg.get("sender_id", -1))
-                if emg_id == EMG_SENSOR_ID:
-                    if abs(float(emg.get("t_ms", 0)) - t_ms) <= SYNC_WIN_MS:
-                        emg_v = float(emg.get("v", 0.0))
-            except Exception:
-                emg_v = None
-                emg_id = None
+        #if emg:
+            #try:
+                #emg_id = int(emg.get("sender_id", -1))
+                #if emg_id == EMG_SENSOR_ID:
+                    #if abs(float(emg.get("t_ms", 0)) - t_ms) <= SYNC_WIN_MS:
+                        #emg_v = float(emg.get("v", 0.0))
+            #except Exception:
+                #emg_v = None
+                #emg_id = None
 
         # ---- RMS & envelope (nếu có emg_v)
-        if emg_v is not None:
-            rms = emg_rms(EMG_BUF)
-            EMG_ENV = EMG_ALPHA * rms + (1 - EMG_ALPHA) * EMG_ENV
-            max_payload["emg"] = emg_v                 # ✅ emg là SỐ (frontend vẽ được)
-            max_payload["sender_id"] = emg_id          # ✅ cho JS lọc sensor 5
-            max_payload["emg_id"] = emg_id
-            max_payload["emg_rms"] = rms
-            max_payload["emg_env"] = EMG_ENV
+        #if emg_v is not None:
+            #rms = emg_rms(EMG_BUF)
+            #EMG_ENV = EMG_ALPHA * rms + (1 - EMG_ALPHA) * EMG_ENV
+            #max_payload["emg"] = emg_v                 # ✅ emg là SỐ (frontend vẽ được)
+            #max_payload["sender_id"] = emg_id          # ✅ cho JS lọc sensor 5
+            #max_payload["emg_id"] = emg_id
+            #max_payload["emg_rms"] = rms
+            #max_payload["emg_env"] = EMG_ENV
 
         # ---- lưu buffer
         with DATA_LOCK:
@@ -415,10 +415,10 @@ def append_samples(samples):
                 "hip": hip,
                 "knee": knee,
                 "ankle": ankle,
-                "emg": max_payload.get("emg"),
-                "emg_id": max_payload.get("emg_id"),
-                "emg_rms": max_payload.get("emg_rms"),
-                "emg_env": max_payload.get("emg_env"),
+                #"emg": max_payload.get("emg"),
+                #"emg_id": max_payload.get("emg_id"),
+                #"emg_rms": max_payload.get("emg_rms"),
+                #"emg_env": max_payload.get("emg_env"),
             })
 
         # ---- emit ra UI
@@ -612,7 +612,7 @@ def session_export_csv():
     sio = io.StringIO()
     w = csv.writer(sio)
     # ✅ header đúng
-    w.writerow(["t_ms", "hip", "knee", "ankle", "emg", "emg_rms", "emg_env", "emg_id"])
+    w.writerow(["t_ms", "hip", "knee", "ankle"])
 
     for r in rows:
         w.writerow([
@@ -620,10 +620,10 @@ def session_export_csv():
             f'{float(r.get("hip", 0)):.4f}',
             f'{float(r.get("knee", 0)):.4f}',
             f'{float(r.get("ankle", 0)):.4f}',
-            "" if r.get("emg") is None else f'{float(r.get("emg", 0)):.5f}',
-            "" if r.get("emg_rms") is None else f'{float(r.get("emg_rms", 0)):.5f}',
-            "" if r.get("emg_env") is None else f'{float(r.get("emg_env", 0)):.5f}',
-            "" if r.get("emg_id") is None else str(r.get("emg_id")),
+            #"" if r.get("emg") is None else f'{float(r.get("emg", 0)):.5f}',
+            #"" if r.get("emg_rms") is None else f'{float(r.get("emg_rms", 0)):.5f}',
+            #"" if r.get("emg_env") is None else f'{float(r.get("emg_env", 0)):.5f}',
+            #"" if r.get("emg_id") is None else str(r.get("emg_id")),
         ])
 
     csv_text = sio.getvalue()
@@ -4989,6 +4989,7 @@ if __name__ == "__main__":
         debug=True,
         allow_unsafe_werkzeug=True
     )
+
 
 
 
