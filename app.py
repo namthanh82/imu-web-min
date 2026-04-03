@@ -1,314 +1,327 @@
-import os, sys, time, io, csv, json, webbrowser
-from datetime import datetime
-from threading import Timer
-from flask import Flask, request, jsonify, render_template, redirect, url_for, flash, send_file
-from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
-from werkzeug.security import generate_password_hash, check_password_hash
-from flask_socketio import SocketIO
-import database
-import serial_handler
-from database import load_records_from_file
-# --- THƯ VIỆN AI ---
-from langchain.chains import RetrievalQA
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.vectorstores import Chroma
-from langchain.llms import LlamaCpp
-from dotenv import load_dotenv
+import importlib.util
 import os
+import time
+import webbrowser
+from pathlib import Path
+from threading import Lock, Timer
 
-load_dotenv()
+from dotenv import load_dotenv
+from flask import flash, jsonify, redirect, render_template_string, request, url_for
+from flask_login import current_user, login_required
 
-def resource_path(relative_path):
-    try:
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.dirname(os.path.abspath(__file__))
-
-    return os.path.join(base_path, relative_path)
+import database
+import webgiaodien
 
 
-app = Flask(__name__, static_folder=resource_path('static'), template_folder=resource_path('templates'))
-# --- KHỞI TẠO BỘ NÃO AI (Load 1 lần duy nhất khi bật Web) ---
-print("Đang nạp bộ não AI (Card RTX đang làm việc)...")
-embeddings = HuggingFaceEmbeddings(model_name=os.environ.get("EMBEDDINGS_MODEL_NAME"))
-db = Chroma(persist_directory=os.environ.get('PERSIST_DIRECTORY'), embedding_function=embeddings)
-retriever = db.as_retriever(search_kwargs={"k": 2})
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
-llm = LlamaCpp(
-    model_path=os.environ.get('MODEL_PATH'),
-    n_ctx=4096,
-    n_gpu_layers=40, # RTX gánh
-    n_threads=4,
-    verbose=False
+app = webgiaodien.app
+socketio = webgiaodien.socketio
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "CHANGE_ME")
+
+def env_path(name: str, default: str | None = None) -> Path | None:
+    raw_value = os.environ.get(name, default)
+    if not raw_value:
+        return None
+
+    path = Path(raw_value)
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    return path
+
+webgiaodien.EMG_CHART_HTML = webgiaodien.EMG_CHART_HTML.replace(
+    "const emg_env_raw = {{ (emg_env or []) | tojson }};\n\n/*",
+    """const emg_env_raw = {{ (emg_env or []) | tojson }};
+
+let t_ms     = (t_ms_raw    || []).slice();
+let hipArr   = (hip_raw     || []).slice();
+let kneeArr  = (knee_raw    || []).slice();
+let ankleArr = (ankle_raw   || []).slice();
+let emgArr    = (emg_raw     || []).slice();
+let emgRmsArr = (emg_rms_raw || []).slice();
+let emgEnvArr = (emg_env_raw || []).slice();
+
+/*""",
 )
-qa_chain = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=retriever)
-print("AI ĐÃ SẴN SÀNG!")
-app.secret_key = "CHANGE_ME"
+webgiaodien.EMG_CHART_HTML = webgiaodien.EMG_CHART_HTML.replace(
+    "rms_len: emgRms.length,",
+    "rms_len: emgRmsArr.length,",
+)
+webgiaodien.EMG_CHART_HTML = webgiaodien.EMG_CHART_HTML.replace(
+    "env_len: emgEnv.length,",
+    "env_len: emgEnvArr.length,",
+)
+webgiaodien.EMG_CHART_HTML = webgiaodien.EMG_CHART_HTML.replace(
+    "if (emgRms && emgRms.length) datasets.push({ label:\"rms\", data: emgRms, borderWidth:2, tension:0.15 });",
+    "if (emgRmsArr && emgRmsArr.length) datasets.push({ label:\"rms\", data: emgRmsArr, borderWidth:2, tension:0.15 });",
+)
+webgiaodien.EMG_CHART_HTML = webgiaodien.EMG_CHART_HTML.replace(
+    "if (emgEnv && emgEnv.length) datasets.push({ label:\"env\", data: emgEnv, borderWidth:2, tension:0.15 });",
+    "if (emgEnvArr && emgEnvArr.length) datasets.push({ label:\"env\", data: emgEnvArr, borderWidth:2, tension:0.15 });",
+)
 
-socketio = SocketIO(app, cors_allowed_origins="*", ping_interval=10, ping_timeout=30, async_mode="threading")
-
-# --- Xử lý Login ---
-login_manager = LoginManager(app)
-login_manager.login_view = "login"
-USERS = {"komlab": generate_password_hash("123456")}
-
-
-class User(UserMixin):
-    def __init__(self, u): self.id = u
-
-
-@login_manager.user_loader
-def load_user(u):
-    return User(u) if u in USERS else None
-
-
-EXERCISE_VIDEOS = {
-    "ankle flexion": "/static/videos/ankle_flexion.mp4",
-    "knee flexion": "/static/videos/knee_flexion.mp4",
-    "hip flexion": "/static/videos/hip_flexion.mp4",
+AI_LOCK = Lock()
+AI_STATE = {"qa_chain": None, "error": None}
+AI_DEPENDENCIES = {
+    "langchain": "langchain",
+    "chromadb": "chromadb",
+    "llama-cpp-python": "llama_cpp",
+    "sentence-transformers": "sentence_transformers",
 }
 
 
-# ================= ROUTES GIAO DIỆN (HTML) =================
-@socketio.on("connect")
-def _on_connect():
-    socketio.emit("imu_data", {"t": time.time() * 1000, "hip": 0, "knee": 0, "ankle": 0})
+def init_ai_chain():
+    with AI_LOCK:
+        if AI_STATE["qa_chain"] is not None:
+            return AI_STATE["qa_chain"]
+
+        model_path = env_path("MODEL_PATH")
+        persist_directory = env_path("PERSIST_DIRECTORY", "db")
+
+        if not model_path or not model_path.exists():
+            AI_STATE["error"] = "Model file was not found. Check MODEL_PATH in .env."
+            return None
+
+        if persist_directory is None:
+            AI_STATE["error"] = "PERSIST_DIRECTORY is not configured."
+            return None
+
+        persist_directory.mkdir(parents=True, exist_ok=True)
+        if not any(persist_directory.iterdir()):
+            AI_STATE["error"] = "Vector store is empty. Add files to source_documents/ and run python ingest.py."
+            return None
+
+        missing_dependencies = [
+            package_name
+            for package_name, module_name in AI_DEPENDENCIES.items()
+            if importlib.util.find_spec(module_name) is None
+        ]
+        if missing_dependencies:
+            AI_STATE["error"] = (
+                "Missing AI packages: "
+                + ", ".join(missing_dependencies)
+                + ". Install them with python -m pip install -r requirements-ai.txt."
+            )
+            return None
+
+        try:
+            from langchain.chains import RetrievalQA
+            from langchain.embeddings import HuggingFaceEmbeddings
+            from langchain.llms import LlamaCpp
+            from langchain.vectorstores import Chroma
+        except Exception as exc:
+            AI_STATE["error"] = f"AI imports failed: {exc}"
+            return None
+
+        try:
+            embeddings = HuggingFaceEmbeddings(
+                model_name=os.environ.get(
+                    "EMBEDDINGS_MODEL_NAME",
+                    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+                )
+            )
+            vector_db = Chroma(
+                persist_directory=str(persist_directory),
+                embedding_function=embeddings,
+            )
+            retriever = vector_db.as_retriever(search_kwargs={"k": 2})
+            llm = LlamaCpp(
+                model_path=str(model_path),
+                n_ctx=int(os.environ.get("MODEL_N_CTX", "4096")),
+                n_gpu_layers=int(os.environ.get("MODEL_N_GPU_LAYERS", "40")),
+                n_threads=int(os.environ.get("MODEL_N_THREADS", "4")),
+                verbose=False,
+            )
+            AI_STATE["qa_chain"] = RetrievalQA.from_chain_type(
+                llm=llm,
+                chain_type="stuff",
+                retriever=retriever,
+            )
+            AI_STATE["error"] = None
+            return AI_STATE["qa_chain"]
+        except Exception as exc:
+            AI_STATE["error"] = f"AI initialization failed: {exc}"
+            return None
 
 
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    error_message = None
-    if request.method == "POST":
-        u = request.form.get("username", "").strip()
-        p = request.form.get("password", "")
-        if u in USERS and check_password_hash(USERS[u], p):
-            login_user(User(u))
-            return redirect(url_for("dashboard"))
-        error_message = "Sai tài khoản hoặc mật khẩu"
-    return render_template("login.html", error_message=error_message)
+def latest_session_series() -> dict[str, list[float]]:
+    rows = list(webgiaodien.LAST_SESSION)
+    rows.sort(key=lambda row: row["t_ms"])
+
+    if not rows:
+        return {
+            "t_ms": [],
+            "hip": [],
+            "knee": [],
+            "ankle": [],
+            "emg": [],
+            "emg_rms": [],
+            "emg_env": [],
+        }
+
+    t0 = rows[0]["t_ms"]
+    return {
+        "t_ms": [round((row["t_ms"] - t0) / 1000.0, 3) for row in rows],
+        "hip": [row.get("hip", 0.0) for row in rows],
+        "knee": [row.get("knee", 0.0) for row in rows],
+        "ankle": [row.get("ankle", 0.0) for row in rows],
+        "emg": [row.get("emg", 0.0) or 0.0 for row in rows],
+        "emg_rms": [row.get("emg_rms", 0.0) or 0.0 for row in rows],
+        "emg_env": [row.get("emg_env", 0.0) or 0.0 for row in rows],
+    }
 
 
-@app.route("/logout")
 @login_required
-def logout():
-    logout_user()
-    return redirect(url_for("login"))
+def session_start():
+    webgiaodien.data_buffer = []
+    webgiaodien.reset_max_angles()
+
+    if webgiaodien.SERIAL_ENABLED:
+        port = (
+            os.environ.get("SERIAL_PORT")
+            or webgiaodien.auto_detect_port()
+            or ("COM3" if os.name == "nt" else "/dev/ttyUSB0")
+        )
+        baud = int(os.environ.get("SERIAL_BAUD", "115200"))
+        ok = webgiaodien.start_serial_reader(port=port, baud=baud)
+        if not ok:
+            return jsonify(ok=False, msg=f"Không mở được cổng serial (port={port})"), 500
+        return jsonify(ok=True, mode="serial", port=port, baud=baud)
+
+    return jsonify(ok=True, mode="noserial")
 
 
-@app.route("/")
-@login_required
-def dashboard():
-    return render_template("dashboard.html", username=current_user.id, videos=EXERCISE_VIDEOS)
-
-
-@app.route("/calibration")
-@login_required
-def calibration():
-    open_guide = request.args.get("guide", "0") in ("1", "true", "yes")
-    return render_template("calibration.html", username=current_user.id, open_guide=open_guide)
-
-@app.route('/api/chat', methods=['POST'])
-def api_chat():
-    data = request.json
-    user_query = data.get('query', '')
-    if not user_query:
-        return jsonify({'answer': 'Vui lòng nhập câu hỏi.'}), 400
-
-    # Ép AI nói tiếng Việt để thông minh hơn
-    prompt = f"Dựa vào tài liệu, hãy trả lời câu hỏi sau bằng tiếng Việt: {user_query}"
-
-    # Nhờ AI xử lý
-    res = qa_chain(prompt)
-    return jsonify({'answer': res['result']})
-@app.route("/records")
-@login_required
-def records():
-    with database.RECORD_LOCK:
-        rows = list(database.RECORD_STORE)
-    rows.sort(key=lambda r: r.get("created_at_ts", 0), reverse=True)
-    for r in rows:
-        if "vas_summary" not in r or r["vas_summary"] is None: r["vas_summary"] = {}
-    return render_template("records.html", username=current_user.id, records=rows)
+app.view_functions["session_start"] = session_start
 
 
 @app.route("/patients/manage")
 @login_required
-def view_patients_manage():
-    return render_template("patients_manage.html")
+def patients_manage():
+    return render_template_string(webgiaodien.PATIENTS_MANAGE_HTML, username=current_user.id)
 
 
-@app.route("/charts")
+@app.route("/patients/new", methods=["GET", "POST"])
 @login_required
-def charts():
-    patient_code = request.args.get("patient_code", "").strip()
-    exercise_name = request.args.get("exercise", "").strip()
+def patients_new():
+    if request.method == "POST":
+        full_name = request.form.get("full_name", "").strip()
+        if not full_name:
+            flash("Thiếu họ tên", "danger")
+            return render_template_string(webgiaodien.PATIENT_NEW_HTML)
 
-    # Lấy VAS
-    vas_before = None
-    vas_after = None
-    region = "hip" if "hip" in exercise_name.lower() else "knee" if "knee" in exercise_name.lower() else "ankle"
+        _, raw = database.load_patients_rows()
+        patient_code = database.gen_patient_code(full_name)
+        raw[patient_code] = {
+            "DateOfBirth": request.form.get("dob", "").strip(),
+            "Gender": request.form.get("sex", "").strip(),
+            "Height": request.form.get("height", "").strip(),
+            "ID": request.form.get("national_id", "").strip(),
+            "PatientCode": patient_code,
+            "Weight": request.form.get("weight", "").strip(),
+            "name": full_name,
+        }
+        database.save_patients_data(raw)
+        flash(f"Đã lưu bệnh nhân {patient_code}", "success")
+        return redirect(url_for("patients_manage"))
 
-    with database.VAS_LOCK:
-        for rec in reversed(database.VAS_STORE):
-            if rec.get("exercise_region") != region: continue
-            if patient_code and rec.get("patient_code") != patient_code: continue
-            ph = rec.get("phase")
-            if ph == "before" and vas_before is None:
-                vas_before = rec.get("vas")
-            elif ph == "after" and vas_after is None:
-                vas_after = rec.get("vas")
-            if vas_before is not None and vas_after is not None: break
+    return render_template_string(webgiaodien.PATIENT_NEW_HTML)
 
-    if not serial_handler.LAST_SESSION:
-        return render_template("charts.html", username=current_user.id, t_ms=[], hip=[], knee=[], ankle=[], emg=[],
-                               emg_rms=[], emg_env=[], patient_code=patient_code, exercise_name=exercise_name,
-                               vas_before=vas_before, vas_after=vas_after)
 
-    rows = sorted(list(serial_handler.LAST_SESSION), key=lambda x: x["t_ms"])
-    t0 = rows[0]["t_ms"] if rows else 0
-    t_ms = [round((r["t_ms"] - t0) / 1000.0, 3) for r in rows]
+@app.route("/patients")
+@login_required
+def patients_review():
+    return redirect(url_for("patients_manage"))
 
-    hipArr = [r.get("hip", 0.0) for r in rows]
-    kneeArr = [r.get("knee", 0.0) for r in rows]
-    ankleArr = [r.get("ankle", 0.0) for r in rows]
 
-    return render_template("charts.html", username=current_user.id, t_ms=t_ms, hip=hipArr, knee=kneeArr, ankle=ankleArr,
-                           emg=[], emg_rms=[], emg_env=[], patient_code=patient_code, exercise_name=exercise_name,
-                           vas_before=vas_before, vas_after=vas_after)
+@app.delete("/api/patients/<code>")
+@login_required
+def api_patients_delete(code: str):
+    _, raw = database.load_patients_rows()
+    if code not in raw:
+        return jsonify(ok=False, msg="Không tìm thấy bệnh nhân"), 404
+
+    raw.pop(code, None)
+    database.save_patients_data(raw)
+    return jsonify(ok=True)
+
+
+@app.delete("/api/patients")
+@login_required
+def api_patients_delete_all():
+    database.save_patients_data({})
+    return jsonify(ok=True)
+
+
+@login_required
+def api_patients_save():
+    data = request.get_json(force=True) or {}
+    patient_code = (data.get("patient_code") or "").strip()
+    full_name = (data.get("name") or "").strip()
+    if not full_name:
+        return jsonify(ok=False, msg="Thiếu họ tên"), 400
+
+    _, raw = database.load_patients_rows()
+    if not patient_code:
+        patient_code = database.gen_patient_code(full_name)
+
+    gender = (data.get("gender") or "").strip()
+    if gender.lower().startswith("m"):
+        gender = "Male"
+    elif gender.lower().startswith("f"):
+        gender = "Female"
+
+    raw[patient_code] = {
+        "DateOfBirth": data.get("dob", ""),
+        "Gender": gender,
+        "Height": data.get("height", ""),
+        "ID": data.get("national_id", ""),
+        "PatientCode": patient_code,
+        "Weight": data.get("weight", ""),
+        "name": full_name,
+    }
+    database.save_patients_data(raw)
+    return jsonify(ok=True, patient_code=patient_code)
+
+
+app.view_functions["api_patients_save"] = api_patients_save
 
 
 @app.route("/charts_emg")
 @login_required
 def charts_emg():
-    return render_template("emg_chart.html", username=current_user.id)
+    return render_template_string(
+        webgiaodien.EMG_CHART_HTML,
+        username=current_user.id,
+        **latest_session_series(),
+    )
 
 
-@app.route("/settings")
-@login_required
-def settings_page():
-    return render_template("settings.html", username=current_user.id)
-
-
-# ================= ROUTES API (Xử lý Data/Hardware) =================
-@app.route("/ports")
-@login_required
-def ports():
-    if not serial_handler.list_ports: return jsonify(ports=[])
-    return jsonify(ports=[{"device": p.device, "desc": p.description} for p in serial_handler.list_ports.comports()])
-
-
-@app.post("/session/start")
-@login_required
-def session_start():
-    serial_handler.data_buffer = []
-    serial_handler.reset_max_angles()
-    if serial_handler.SERIAL_ENABLED:
-        port = os.environ.get("SERIAL_PORT") or "COM3"
-        baud = int(os.environ.get("SERIAL_BAUD", "115200"))
-        # Truyền socketio vào đây
-        if not serial_handler.start_serial_reader(socketio, port=port, baud=baud):
-            return jsonify(ok=False, msg=f"Không mở được cổng serial (port={port})"), 500
-        return jsonify(ok=True, mode="serial", port=port, baud=baud)
-    return jsonify(ok=True, mode="noserial")
-
-
-@app.post("/session/stop")
-@login_required
-def session_stop():
-    if serial_handler.SERIAL_ENABLED: serial_handler.stop_serial_reader()
-    with serial_handler.DATA_LOCK:
-        serial_handler.LAST_SESSION = list(serial_handler.data_buffer)
-        serial_handler.data_buffer.clear()
-    return jsonify(ok=True, msg="Đã kết thúc phiên đo")
-
-
-@app.get("/api/patients")
-@login_required
-def api_patients_all():
-    rows, raw = database.load_patients_rows()
-    return jsonify(rows=rows, raw=raw)
-
-
-@app.post("/api/patients")
-@login_required
-def api_patients_save():
-    data = request.get_json(force=True) or {}
-    code = (data.get("patient_code") or "").strip()
-    full_name = (data.get("name") or "").strip()
-    if not full_name: return jsonify(ok=False, msg="Thiếu họ tên"), 400
-
-    _, raw = database.load_patients_rows()
-    if not code: code = database.gen_patient_code(full_name)
-
-    raw[code] = {
-        "DateOfBirth": data.get("dob", ""),
-        "Gender": "Male" if data.get("gender", "").lower().startswith("m") else "FeMale",
-        "Height": data.get("height", ""), "ID": data.get("national_id", ""),
-        "PatientCode": code, "Weight": data.get("weight", ""), "name": full_name
-    }
-    database.save_patients_data(raw)
-    return jsonify(ok=True, patient_code=code)
-
-load_records_from_file()
-@app.post("/api/save_record")
-@login_required
-def api_save_record():
-    data = request.get_json(force=True) or {}
-    now = datetime.now(database.VN_TZ)
-    record = {
-        "created_at_ts": now.timestamp(),
-        "created_at": now.strftime("%Y-%m-%d %H:%M:%S"),
-        "patient_code": data.get("patient_code", ""),
-        "measure_date": data.get("measure_date", ""),
-        "patient_info": data.get("patient_info", {}),
-        "exercise_scores": data.get("exercise_scores", {}),
-        "vas_summary": {}
-    }
-    with database.RECORD_LOCK:
-        database.RECORD_STORE.append(record)
-        database.save_records_to_file()
-    return jsonify(ok=True, msg="saved", record=record)
-
-
-@app.post("/api/delete_record")
-@login_required
-def api_delete_record():
+@app.route("/api/chat", methods=["POST"])
+def api_chat():
     data = request.get_json(silent=True) or {}
-    idx = data.get("index")
-    with database.RECORD_LOCK:
-        if idx is not None and 0 <= idx < len(database.RECORD_STORE):
-            database.RECORD_STORE.pop(idx)
-            database.save_records_to_file()
-            return jsonify(ok=True)
-    return jsonify(ok=False, msg="Index không hợp lệ"), 400
+    user_query = data.get("query", "").strip()
+    if not user_query:
+        return jsonify({"answer": "Vui lòng nhập câu hỏi."}), 400
 
+    qa_chain = init_ai_chain()
+    if qa_chain is None:
+        return jsonify({"answer": AI_STATE["error"]}), 503
 
-@app.post("/save_vas")
-def save_vas():
-    data = request.get_json(silent=True) or {}
-    rec = {
-        "patient_code": data.get("patient_code"),
-        "exercise_name": data.get("exercise_name"),
-        "exercise_region": data.get("exercise_region"),
-        "phase": data.get("phase"),
-        "vas": float(data.get("vas", 0)),
-        "ts": time.time(),
-    }
-    with database.VAS_LOCK:
-        database.VAS_STORE.append(rec)
-    return jsonify(ok=True)
+    prompt = f"Dựa vào tài liệu, hãy trả lời câu hỏi sau bằng tiếng Việt: {user_query}"
+    try:
+        result = qa_chain(prompt)
+    except Exception as exc:
+        return jsonify({"answer": f"AI query failed: {exc}"}), 500
+
+    return jsonify({"answer": result["result"]})
 
 
 if __name__ == "__main__":
-    database.load_records_from_file()
+    port = int(os.environ.get("PORT", "8080"))
 
-    port = int(os.environ.get("PORT", 8080))
+    if os.environ.get("AUTO_OPEN_BROWSER", "1") == "1":
+        Timer(1.5, lambda: webbrowser.open_new(f"http://127.0.0.1:{port}")).start()
 
-
-    def open_browser(): webbrowser.open_new(f"http://127.0.0.1:{port}")
-
-
-    Timer(1.5, open_browser).start()
-
-    print(f"Đang chạy server tại cổng {port}...")
-    socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
+    print(f"Server listening on port {port}.")
+    socketio.run(app, host="0.0.0.0", port=port, debug=False, allow_unsafe_werkzeug=True)

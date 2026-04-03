@@ -1912,6 +1912,39 @@ body{ background:#fafbfe }
 
 /* nền khung three: xanh nhạt; muốn trắng đổi thành #ffffff */
 #threeMount{ background:#eaf2ff; }
+.three-toolbar{
+  display:flex;
+  align-items:center;
+  justify-content:flex-end;
+  gap:10px;
+  flex-wrap:wrap;
+}
+.model-switcher{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  flex-wrap:wrap;
+  justify-content:flex-end;
+}
+.model-switch-btn{
+  min-width:104px;
+  padding:8px 14px;
+}
+.model-switch-btn.active{
+  background:#e6f2ff;
+  border-color:#9ccaff;
+  color:#073c74;
+}
+@media (max-width:991.98px){
+  .three-toolbar,
+  .model-switcher{
+    width:100%;
+    justify-content:flex-start;
+  }
+  .model-switch-btn{
+    min-width:0;
+  }
+}
 
 /* ===================== EMG UI (đẹp + dễ quan sát) ===================== */
 .emg-card{
@@ -2182,9 +2215,16 @@ body{ background:#fafbfe }
         <!-- MÔ PHỎNG 3D -->
         <div class="col-lg-7 pull-up-guide">
           <div class="panel">
-            <div class="d-flex align-items-center justify-content-between mb-2">
+            <div class="d-flex align-items-center justify-content-between mb-2 flex-wrap gap-2">
               <span class="title-chip" data-i18n="dash.3d_title">MÔ PHỎNG 3D</span>
-              <div class="small text-muted" data-i18n="dash.3d_source">Nguồn: hip/knee/ankle từ IMU (độ)</div>
+              <div class="three-toolbar">
+                <div class="small text-muted" data-i18n="dash.3d_source">Nguồn: hip/knee/ankle từ IMU (độ)</div>
+                <div class="model-switcher" id="model3DSwitcher">
+                  <button type="button" class="btn btn-outline-thick model-switch-btn" data-model-id="full" data-i18n="dash.model_full">Toàn thân</button>
+                  <button type="button" class="btn btn-outline-thick model-switch-btn" data-model-id="lower" data-i18n="dash.model_lower">Chi dưới</button>
+                  <button type="button" class="btn btn-outline-thick model-switch-btn active" data-model-id="leg" data-i18n="dash.model_leg">Chân</button>
+                </div>
+              </div>
             </div>
 
             <div id="threeMount" style="width:100%; height:480px; min-height:480px; border-radius:14px; overflow:visible; position:relative; z-index:1;"></div>
@@ -2357,6 +2397,9 @@ const I18N = {
 
     "dash.3d_title": "MÔ PHỎNG 3D",
     "dash.3d_source": "Nguồn: hip/knee/ankle từ IMU (độ)",
+    "dash.model_full": "Toàn thân",
+    "dash.model_lower": "Chi dưới",
+    "dash.model_leg": "Chân",
     "dash.reset3d": "Reset 3D",
 
     "dash.start_measure": "Bắt đầu đo",
@@ -2411,6 +2454,9 @@ const I18N = {
 
     "dash.3d_title": "3D Simulation",
     "dash.3d_source": "Source: hip/knee/ankle from IMU (deg)",
+    "dash.model_full": "Full body",
+    "dash.model_lower": "Lower body",
+    "dash.model_leg": "Leg",
     "dash.reset3d": "Reset 3D",
 
     "dash.start_measure": "Start measurement",
@@ -2694,135 +2740,237 @@ scene.add(legPivot);
 window.legPivot = legPivot;
 
 const loader = new GLTFLoader();
-const GLB_URL = "{{ url_for('static', filename='models/leg_model.glb') }}";
+const MODEL_URLS = {
+  full: "{{ url_for('static', filename='models/fullbody3.glb') }}",
+  lower: "{{ url_for('static', filename='models/lower_body1.glb') }}",
+  leg: "{{ url_for('static', filename='models/leg_model.glb') }}",
+};
+const modelButtons = Array.from(document.querySelectorAll('.model-switch-btn'));
+const JOINT_NAME_MAP = {
+  hip: ['thighL', 'thigh.L', 'thigh_l', 'leftThigh', 'upperLeg.L', 'upperleg.L'],
+  knee: ['shinL', 'shin.L', 'shin_l', 'leftShin', 'lowerLeg.L', 'lowerleg.L', 'calf.L'],
+  ankle: ['footL', 'foot.L', 'foot_l', 'leftFoot', 'ankle.L'],
+};
+const AXISVEC = { x:new THREE.Vector3(1,0,0), y:new THREE.Vector3(0,1,0), z:new THREE.Vector3(0,0,1) };
+const AXIS = { hip:'x', knee:'x', ankle:'x' };
+const SIGN = { hip:-1, knee: 1, ankle: 1 };
+const OFF  = { hip: 0, knee: 0, ankle:-90 };
+const toRad = d => (Number(d) || 0) * Math.PI / 180;
 
-loader.load(
-  GLB_URL,
-  (gltf) => {
-    const model = gltf.scene || gltf.scenes?.[0];
-    if (!model) { statusEl.textContent = "⚠️ GLB không có scene."; return; }
+let activeModelId = 'leg';
+let currentModel = null;
+let currentBoneRegistry = new Map();
+let loadToken = 0;
 
-    window.SKINS = [];
-    model.traverse((o) => {
-      if (o.isSkinnedMesh) {
-        o.frustumCulled = false;
-        o.castShadow = o.receiveShadow = true;
-        window.SKINS.push(o);
-      } else if (o.isMesh) {
-        o.visible = false;
+function normalizeBoneKey(name) {
+  return (name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function setActiveModelButton(modelId) {
+  for (const btn of modelButtons) {
+    btn.classList.toggle('active', btn.dataset.modelId === modelId);
+  }
+}
+
+function getModelLabel(modelId) {
+  return modelButtons.find((btn) => btn.dataset.modelId === modelId)?.textContent.trim() || modelId;
+}
+
+function clearCurrentModel() {
+  if (!currentModel) return;
+  legPivot.remove(currentModel);
+  currentModel = null;
+  currentBoneRegistry = new Map();
+  window.SKINS = [];
+  window.legReady = false;
+}
+
+function buildBoneRegistry() {
+  currentBoneRegistry = new Map();
+  for (const sm of window.SKINS) {
+    for (const b of sm.skeleton.bones) {
+      const key = normalizeBoneKey(b.name);
+      if (!key) continue;
+      if (!currentBoneRegistry.has(key)) currentBoneRegistry.set(key, []);
+      currentBoneRegistry.get(key).push(b);
+      if (!b.userData.bindQ) b.userData.bindQ = b.quaternion.clone();
+    }
+  }
+}
+
+function getBones(joint) {
+  const aliases = JOINT_NAME_MAP[joint] || [];
+  for (const alias of aliases) {
+    const bones = currentBoneRegistry.get(normalizeBoneKey(alias));
+    if (bones && bones.length) return bones;
+  }
+  return [];
+}
+
+function setJointDeg(joint, deg) {
+  const bones = getBones(joint);
+  if (!bones.length) return;
+  const ax = AXISVEC[AXIS[joint]] || AXISVEC.x;
+  const qDelta = new THREE.Quaternion().setFromAxisAngle(
+    ax,
+    SIGN[joint] * toRad((OFF[joint] || 0) + (Number(deg) || 0))
+  );
+  for (const b of bones) {
+    const q0 = b.userData.bindQ || b.quaternion;
+    b.quaternion.copy(q0).multiply(qDelta);
+  }
+}
+
+function resetCurrentPose() {
+  for (const arr of currentBoneRegistry.values()) {
+    for (const b of arr) {
+      if (b.userData.bindQ) b.quaternion.copy(b.userData.bindQ);
+    }
+  }
+}
+
+window.applyLegAngles = (hip, knee, ankle_real) => {
+  setJointDeg('hip', hip);
+  setJointDeg('knee', knee);
+  setJointDeg('ankle', ankle_real);
+};
+
+document.getElementById('btnResetPose3D')?.addEventListener('click', () => {
+  resetCurrentPose();
+});
+
+function prepareModel(model) {
+  window.SKINS = [];
+  model.traverse((o) => {
+    if (o.isSkinnedMesh) {
+      o.frustumCulled = false;
+      o.castShadow = o.receiveShadow = true;
+      window.SKINS.push(o);
+    } else if (o.isMesh) {
+      o.visible = false;
+    }
+  });
+
+  model.rotation.set(0, 0, 0);
+  model.scale.set(1, 1, 1);
+  model.position.set(0, 0, 0);
+  model.updateMatrixWorld(true);
+
+  for (const sm of window.SKINS) {
+    sm.normalizeSkinWeights();
+    sm.skeleton.pose();
+    sm.skeleton.calculateInverses();
+    sm.bind(sm.skeleton);
+  }
+
+  legPivot.add(model);
+  legPivot.rotation.y = Math.PI;
+
+  const box0 = new THREE.Box3().setFromObject(model);
+  const size0 = new THREE.Vector3();
+  box0.getSize(size0);
+  const center0 = new THREE.Vector3();
+  box0.getCenter(center0);
+  model.position.sub(center0);
+  model.updateMatrixWorld(true);
+
+  const maxDim = Math.max(size0.x, size0.y, size0.z) || 1;
+  const target = GRID_SIZE * 0.55;
+  const scale = target / maxDim;
+  model.scale.setScalar(scale);
+  model.updateMatrixWorld(true);
+
+  const box1 = new THREE.Box3().setFromObject(model);
+  model.position.y += -box1.min.y;
+  model.updateMatrixWorld(true);
+
+  const box2 = new THREE.Box3().setFromObject(model);
+  const center2 = box2.getCenter(new THREE.Vector3());
+  model.position.x -= center2.x;
+  model.position.z -= center2.z;
+  model.updateMatrixWorld(true);
+
+  const sphere = new THREE.Sphere();
+  new THREE.Box3().setFromObject(model).getBoundingSphere(sphere);
+  const sideDist = sphere.radius * 2.2;
+  camera.position.set(sideDist, sphere.radius * 0.35, 0);
+  camera.lookAt(0, sphere.center.y, 0);
+  controls.target.set(0, sphere.center.y, 0);
+  controls.update();
+  controls.minDistance = sphere.radius * 0.8;
+  controls.maxDistance = sphere.radius * 3.0;
+
+  const bbox = new THREE.Box3().setFromObject(model);
+  const size = bbox.getSize(new THREE.Vector3());
+  const rad = size.length() * 0.5 || 1;
+  camera.near = Math.max(0.1, rad * 0.01);
+  camera.far = rad * 20;
+  camera.updateProjectionMatrix();
+
+  buildBoneRegistry();
+}
+
+function applyLatestAngles() {
+  const latest = window._lastAngles || window._pendingAngles;
+  if (!latest) return;
+  window._pendingAngles = null;
+  window.applyLegAngles(latest.hip, latest.knee, latest.ankle);
+}
+
+function loadModel(modelId) {
+  const url = MODEL_URLS[modelId];
+  if (!url) return;
+
+  const currentLoad = ++loadToken;
+  const label = getModelLabel(modelId);
+  statusEl.textContent = `Đang tải mô hình: ${label}`;
+  window.legReady = false;
+
+  loader.load(
+    url,
+    (gltf) => {
+      if (currentLoad !== loadToken) return;
+
+      const model = gltf.scene || gltf.scenes?.[0];
+      if (!model) {
+        statusEl.textContent = `GLB không có scene: ${label}`;
+        return;
       }
-    });
 
-    model.rotation.set(0, 0, 0);
-    model.scale.set(1, 1, 1);
-    model.updateMatrixWorld(true);
-
-    for (const sm of window.SKINS) {
-      sm.normalizeSkinWeights();
-      sm.skeleton.pose();
-      sm.skeleton.calculateInverses();
-      sm.bind(sm.skeleton);
+      clearCurrentModel();
+      currentModel = model;
+      prepareModel(model);
+      activeModelId = modelId;
+      setActiveModelButton(modelId);
+      window.legReady = true;
+      applyLatestAngles();
+      statusEl.textContent = `Đã tải mô hình: ${label}`;
+    },
+    (progress) => {
+      if (currentLoad !== loadToken) return;
+      const percent = (progress.loaded / (progress.total || 1)) * 100;
+      statusEl.textContent = `Đang tải mô hình ${label}: ${percent.toFixed(0)}%`;
+    },
+    (err) => {
+      if (currentLoad !== loadToken) return;
+      console.error("❌ Lỗi load GLB:", err);
+      statusEl.textContent = `Không tải được mô hình: ${label}`;
+      window.legReady = currentModel != null;
+      setActiveModelButton(activeModelId);
     }
+  );
+}
 
-    legPivot.add(model);
-    legPivot.rotation.y = Math.PI;
+for (const btn of modelButtons) {
+  btn.addEventListener('click', () => {
+    const nextModelId = btn.dataset.modelId;
+    if (!nextModelId || nextModelId === activeModelId) return;
+    loadModel(nextModelId);
+  });
+}
 
-    const box0 = new THREE.Box3().setFromObject(model);
-    const size0 = new THREE.Vector3(); box0.getSize(size0);
-    const center0 = new THREE.Vector3(); box0.getCenter(center0);
-    model.position.sub(center0);
-    model.updateMatrixWorld(true);
-
-    const maxDim = Math.max(size0.x, size0.y, size0.z) || 1;
-    const TARGET = GRID_SIZE * 0.55;
-    const scale = TARGET / maxDim;
-    model.scale.setScalar(scale);
-    model.updateMatrixWorld(true);
-
-    const box1 = new THREE.Box3().setFromObject(model);
-    model.position.y += -box1.min.y;
-    model.updateMatrixWorld(true);
-
-    const box2 = new THREE.Box3().setFromObject(model);
-    const c2 = box2.getCenter(new THREE.Vector3());
-    model.position.x -= c2.x;
-    model.position.z -= c2.z;
-    model.updateMatrixWorld(true);
-
-    const sphere = new THREE.Sphere();
-    new THREE.Box3().setFromObject(model).getBoundingSphere(sphere);
-    const sideDist = sphere.radius * 2.2;
-    camera.position.set(sideDist, sphere.radius * 0.35, 0);
-    camera.lookAt(0, sphere.center.y, 0);
-    controls.target.set(0, sphere.center.y, 0);
-    controls.update();
-    controls.minDistance = sphere.radius * 0.8;
-    controls.maxDistance = sphere.radius * 3.0;
-
-    const BONE_REG = new Map();
-    for (const sm of window.SKINS) {
-      for (const b of sm.skeleton.bones) {
-        const key = (b.name || '').toLowerCase();
-        if (!key) continue;
-        if (!BONE_REG.has(key)) BONE_REG.set(key, []);
-        BONE_REG.get(key).push(b);
-        if (!b.userData.bindQ) b.userData.bindQ = b.quaternion.clone();
-      }
-    }
-
-    const NAME_MAP = { hip: 'thighL', knee: 'shinL', ankle: 'footL' };
-    function getBones(joint) {
-      const key = (NAME_MAP[joint] || '').toLowerCase();
-      return BONE_REG.get(key) || [];
-    }
-
-    const AXISVEC = { x:new THREE.Vector3(1,0,0), y:new THREE.Vector3(0,1,0), z:new THREE.Vector3(0,0,1) };
-    const AXIS = { hip:'x', knee:'x', ankle:'x' };
-    const SIGN = { hip:-1, knee: 1, ankle: 1 };
-    const OFF  = { hip: 0, knee: 0, ankle:-90 };
-    const toRad = d => (Number(d)||0) * Math.PI/180;
-
-    function setJointDeg(joint, deg){
-      const bones = getBones(joint);
-      if (!bones.length) return;
-      const ax = AXISVEC[AXIS[joint]] || AXISVEC.x;
-      const qDelta = new THREE.Quaternion().setFromAxisAngle(ax, SIGN[joint]*toRad((OFF[joint]||0) + (Number(deg)||0)));
-      for (const b of bones) {
-        const q0 = b.userData.bindQ || b.quaternion;
-        b.quaternion.copy(q0).multiply(qDelta);
-      }
-    }
-
-    window.applyLegAngles = (hip, knee, ankle_real) => {
-      setJointDeg('hip', hip);
-      setJointDeg('knee', knee);
-      setJointDeg('ankle', ankle_real);
-    };
-
-    window.legReady = true;
-    if (window._pendingAngles) {
-      const a = window._pendingAngles;
-      window._pendingAngles = null;
-      window.applyLegAngles(a.hip, a.knee, a.ankle);
-    }
-
-    document.getElementById('btnResetPose3D')?.addEventListener('click', () => {
-      for (const arr of BONE_REG.values()) for (const b of arr) if (b.userData.bindQ) b.quaternion.copy(b.userData.bindQ);
-    });
-
-    const bbox = new THREE.Box3().setFromObject(model);
-    const size = bbox.getSize(new THREE.Vector3());
-    const rad = size.length() * 0.5 || 1;
-    camera.near = Math.max(0.1, rad * 0.01);
-    camera.far  = rad * 20;
-    camera.updateProjectionMatrix();
-  },
-  (progress) => {
-    const percent = (progress.loaded / (progress.total || 1)) * 100;
-    statusEl.textContent = `Đang tải mô hình: ${percent.toFixed(0)}%`;
-  },
-  (err) => { console.error("❌ Lỗi load GLB:", err); }
-);
+setActiveModelButton(activeModelId);
+loadModel(activeModelId);
 
 function animate() {
   requestAnimationFrame(animate);
@@ -2832,6 +2980,7 @@ function animate() {
 animate();
 
 window.pushAngles = (hip, knee, ankle) => {
+  window._lastAngles = { hip, knee, ankle };
   if (window.legReady && typeof window.applyLegAngles === "function") {
     window.applyLegAngles(hip, knee, ankle);
   } else {
