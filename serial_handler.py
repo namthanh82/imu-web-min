@@ -161,8 +161,8 @@ def start_serial_reader(socketio, port=None, baud=115200):
                     hip = 0.0 if mag_hip < DEADZONE else sign_front * mag_hip
 
                     hip = _smooth("hip", clamp(hip, -30.1, 122.1))
-                    knee = _smooth("knee", clamp(abs(knee), 0, 134))
-                    ankle = _smooth("ankle", clamp(abs(ankle), 36, 113))
+                    knee = _smooth("knee", clamp(abs(raw_knee), 0, 134))
+                    ankle = _smooth("ankle", clamp(abs(raw_ankle), 36, 113))
 
                     with MAX_LOCK:
                         if hip > MAX_ANGLES["hip"]: MAX_ANGLES["hip"] = hip
